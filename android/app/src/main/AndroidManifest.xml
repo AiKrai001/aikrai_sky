@@ -1,4 +1,11 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- 反地理编码在部分设备上需要访问网络服务，后续天气接口也会复用该权限。 -->
+    <uses-permission android:name="android.permission.INTERNET"/>
+
+    <!-- 获取经纬度需要定位权限：粗略定位用于城市级兜底，精确定位用于提高省市区解析准确度。 -->
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
+
     <application
         android:label="aikrai_sky"
         android:name="${applicationName}"
