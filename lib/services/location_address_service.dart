@@ -32,6 +32,15 @@ class LocationAddressService {
 
     final placemark = await _reverseGeocode(position);
     final address = _buildAddressRecord(position, placemark);
+    final existingAddress = await _database.fetchAddressByCoordinates(
+      latitude: address.latitude,
+      longitude: address.longitude,
+    );
+
+    if (existingAddress != null) {
+      return existingAddress;
+    }
+
     return _database.insertAddress(address);
   }
 

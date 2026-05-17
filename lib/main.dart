@@ -1,7 +1,11 @@
 import 'package:flutter/material.dart';
 
 import 'models/address_record.dart';
+import 'models/weather_record.dart';
+import 'pages/address_records_page.dart';
+import 'pages/weather_records_page.dart';
 import 'services/address_database_service.dart';
+import 'services/caiyun_weather_service.dart';
 import 'services/location_address_service.dart';
 
 void main() {
@@ -45,8 +49,10 @@ class LocationBootstrapPage extends StatefulWidget {
 class _LocationBootstrapPageState extends State<LocationBootstrapPage>
     with WidgetsBindingObserver {
   final _locationAddressService = const LocationAddressService();
+  final _caiyunWeatherService = const CaiyunWeatherService();
 
   AddressRecord? _latestAddress;
+  WeatherRecord? _latestWeather;
   String _statusText = '准备获取当前位置...';
   bool _isLoading = false;
 
@@ -89,9 +95,25 @@ class _LocationBootstrapPageState extends State<LocationBootstrapPage>
       _latestAddress = latestAddress;
       _statusText = '已读取本地最新地址，正在刷新当前位置...';
     });
+
+    final addressId = latestAddress.id;
+    if (addressId == null) {
+      return;
+    }
+
+    final latestWeather = await AddressDatabaseService.instance
+        .fetchLatestWeatherByAddressId(addressId);
+
+    if (!mounted || latestWeather == null) {
+      return;
+    }
+
+    setState(() {
+      _latestWeather = latestWeather;
+    });
   }
 
-  /// 执行“定位 -> 经纬度反解析 -> 地址表入库”的完整流程。
+  /// 执行“定位 -> 地址入库 -> 天气请求 -> 天气入库”的完整流程。
   Future<void> _captureAndSaveAddress({required String triggerSource}) async {
     if (_isLoading) {
       return;
@@ -112,13 +134,29 @@ class _LocationBootstrapPageState extends State<LocationBootstrapPage>
 
       setState(() {
         _latestAddress = savedAddress;
-        _statusText = '$triggerSource：定位地址已保存到本地地址表。';
+        _latestWeather = null;
+        _statusText = '$triggerSource：定位地址已保存，正在请求天气数据...';
+      });
+
+      final savedWeather = await _caiyunWeatherService.fetchAndSaveWeather(
+        savedAddress,
+      );
+
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _latestWeather = savedWeather;
+        _statusText = '$triggerSource：天气数据已保存到本地天气数据表。';
       });
     } on LocationAddressException catch (error) {
       _showErrorStatus('$triggerSource：${error.message}');
+    } on CaiyunWeatherException catch (error) {
+      _showErrorStatus('$triggerSource：地址已保存，天气获取失败：${error.message}');
     } catch (error) {
-      // 兜底处理平台定位、地理编码或 SQLite 可能抛出的未知异常。
-      _showErrorStatus('$triggerSource：定位地址保存失败，$error');
+      // 兜底处理平台定位、地理编码、网络请求或 SQLite 可能抛出的未知异常。
+      _showErrorStatus('$triggerSource：定位或天气保存失败，$error');
     } finally {
       if (mounted) {
         setState(() {
@@ -146,7 +184,7 @@ class _LocationBootstrapPageState extends State<LocationBootstrapPage>
     return Scaffold(
       appBar: AppBar(title: const Text('Aikrai Sky')),
       body: SafeArea(
-        child: Padding(
+        child: SingleChildScrollView(
           padding: const EdgeInsets.all(20),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -176,16 +214,97 @@ class _LocationBootstrapPageState extends State<LocationBootstrapPage>
                 ],
               ),
               const SizedBox(height: 24),
+              const _DataTableLinks(),
+              const SizedBox(height: 24),
               Text('最新地址记录', style: Theme.of(context).textTheme.titleLarge),
               const SizedBox(height: 12),
               if (latestAddress == null)
                 const Text('暂无地址记录。请确认已开启定位服务并授予定位权限。')
               else
                 _AddressRecordView(address: latestAddress),
+              const SizedBox(height: 24),
+              Text('最新天气数据', style: Theme.of(context).textTheme.titleLarge),
+              const SizedBox(height: 12),
+              if (_latestWeather == null)
+                const Text('暂无天气数据。定位成功后会自动请求彩云天气并保存。')
+              else
+                _WeatherRecordView(weather: _latestWeather!),
             ],
           ),
         ),
       ),
+    );
+  }
+}
+
+/// 数据查看页面入口。
+///
+/// 定位和天气保存逻辑会持续写入本地 SQLite；这两个入口用于直接查看表数据，
+/// 方便调试分页、按日查询和原始响应内容。
+class _DataTableLinks extends StatelessWidget {
+  const _DataTableLinks();
+
+  @override
+  Widget build(BuildContext context) {
+    return Wrap(
+      spacing: 12,
+      runSpacing: 12,
+      children: [
+        OutlinedButton.icon(
+          onPressed: () {
+            Navigator.of(context).push(
+              MaterialPageRoute<void>(
+                builder: (_) => const AddressRecordsPage(),
+              ),
+            );
+          },
+          icon: const Icon(Icons.place),
+          label: const Text('查看地址表'),
+        ),
+        OutlinedButton.icon(
+          onPressed: () {
+            Navigator.of(context).push(
+              MaterialPageRoute<void>(
+                builder: (_) => const WeatherRecordsPage(),
+              ),
+            );
+          },
+          icon: const Icon(Icons.storage),
+          label: const Text('查看天气数据表'),
+        ),
+      ],
+    );
+  }
+}
+
+/// 天气数据保存状态展示组件。
+///
+/// 当前只展示数据库记录元信息，不直接展开原始 JSON，避免页面过长；后续天气首页
+/// 可以从 [WeatherRecord.rawResponse] 中解析 realtime、daily 等节点展示。
+class _WeatherRecordView extends StatelessWidget {
+  const _WeatherRecordView({required this.weather});
+
+  final WeatherRecord weather;
+
+  @override
+  Widget build(BuildContext context) {
+    final rows = [
+      ('地址Id', '${weather.addressId}'),
+      ('天气日期', weather.weatherDate),
+      ('原始数据长度', '${weather.rawResponse.length} 字符'),
+      ('创建时间', weather.createdAt.toLocal().toString()),
+      ('更新时间', weather.updatedAt.toLocal().toString()),
+    ];
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        for (final row in rows)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 10),
+            child: Text('${row.$1}：${row.$2}'),
+          ),
+      ],
     );
   }
 }
