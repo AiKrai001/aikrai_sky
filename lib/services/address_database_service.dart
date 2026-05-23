@@ -82,7 +82,7 @@ class AddressDatabaseService {
   /// 重复请求时通过唯一索引更新原始返回数据，而不是插入多条历史数据。
   Future<void> _createWeatherDataTable(Database db) async {
     await db.execute('''
-      CREATE TABLE ${WeatherRecord.tableName} (
+      CREATE TABLE IF NOT EXISTS ${WeatherRecord.tableName} (
         ${WeatherRecord.columnId} INTEGER PRIMARY KEY AUTOINCREMENT,
         ${WeatherRecord.columnAddressId} INTEGER NOT NULL,
         ${WeatherRecord.columnWeatherDate} TEXT NOT NULL,
@@ -96,7 +96,7 @@ class AddressDatabaseService {
     ''');
 
     await db.execute('''
-      CREATE UNIQUE INDEX idx_weather_data_address_date
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_weather_data_address_date
       ON ${WeatherRecord.tableName} (
         ${WeatherRecord.columnAddressId},
         ${WeatherRecord.columnWeatherDate}
@@ -173,6 +173,20 @@ class AddressDatabaseService {
       orderBy: '${AddressRecord.columnCreatedAt} DESC',
       limit: limit,
       offset: offset,
+    );
+
+    return rows.map(AddressRecord.fromMap).toList();
+  }
+
+  /// 查询地址表全部记录。
+  ///
+  /// 首页顶部位置切换需要一次性拿到所有已保存位置，圆点数量和左右滑动页数
+  /// 都直接由这里的记录数决定。
+  Future<List<AddressRecord>> fetchAllAddressRecords() async {
+    final db = await database;
+    final rows = await db.query(
+      AddressRecord.tableName,
+      orderBy: '${AddressRecord.columnCreatedAt} DESC',
     );
 
     return rows.map(AddressRecord.fromMap).toList();

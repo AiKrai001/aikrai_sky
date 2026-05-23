@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:geocoding/geocoding.dart';
 import 'package:geolocator/geolocator.dart';
 
@@ -11,6 +13,12 @@ import 'address_database_service.dart';
 class LocationAddressService {
   const LocationAddressService({this.databaseService});
 
+  /// 定位插件已经传了 timeLimit，这里再包一层业务超时，防止部分厂商 ROM 不按预期返回。
+  static const _locationTimeout = Duration(seconds: 15);
+
+  /// Android 系统反地理编码可能依赖网络或 GMS，真机网络异常时容易长时间挂起。
+  static const _reverseGeocodeTimeout = Duration(seconds: 8);
+
   /// 允许测试或未来依赖注入时替换数据库服务；生产环境默认使用单例。
   final AddressDatabaseService? databaseService;
 
@@ -21,13 +29,17 @@ class LocationAddressService {
   Future<AddressRecord> captureAndSaveCurrentAddress() async {
     await _ensureLocationPermission();
 
-    final position = await Geolocator.getCurrentPosition(
-      locationSettings: const LocationSettings(
-        // 天气应用只需要城市/区县级定位，高精度能提高反地理编码的可用性。
-        accuracy: LocationAccuracy.high,
-        // 防止系统定位长时间无响应导致启动页一直等待。
-        timeLimit: Duration(seconds: 15),
+    final position = await _withTimeout(
+      Geolocator.getCurrentPosition(
+        locationSettings: const LocationSettings(
+          // 天气应用只需要城市/区县级定位，高精度能提高反地理编码的可用性。
+          accuracy: LocationAccuracy.high,
+          // 防止系统定位长时间无响应导致启动页一直等待。
+          timeLimit: _locationTimeout,
+        ),
       ),
+      timeout: _locationTimeout,
+      message: '定位超时，请确认 GPS、网络定位和定位权限是否正常。',
     );
 
     final placemark = await _reverseGeocode(position);
@@ -71,11 +83,16 @@ class LocationAddressService {
   /// 将经纬度反解析为地理地址。
   Future<Placemark> _reverseGeocode(Position position) async {
     // 指定中文结果，确保省、市、区和详细地址尽量返回中文行政区名称。
-    await setLocaleIdentifier('zh_CN');
+    await _withTimeout(
+      setLocaleIdentifier('zh_CN'),
+      timeout: const Duration(seconds: 3),
+      message: '地址解析初始化超时，请稍后重试。',
+    );
 
-    final placemarks = await placemarkFromCoordinates(
-      position.latitude,
-      position.longitude,
+    final placemarks = await _withTimeout(
+      placemarkFromCoordinates(position.latitude, position.longitude),
+      timeout: _reverseGeocodeTimeout,
+      message: '地址解析超时，请检查网络或稍后重试。',
     );
 
     if (placemarks.isEmpty) {
@@ -85,25 +102,32 @@ class LocationAddressService {
     return placemarks.first;
   }
 
+  /// 给平台 Future 增加统一超时，并把 TimeoutException 转成页面可读的业务错误。
+  Future<T> _withTimeout<T>(
+    Future<T> future, {
+    required Duration timeout,
+    required String message,
+  }) async {
+    try {
+      return await future.timeout(timeout);
+    } on TimeoutException {
+      throw LocationAddressException(message);
+    }
+  }
+
   /// 把平台返回的 Placemark 映射为项目地址表字段。
   ///
-  /// 不同 Android 设备和地理编码服务返回字段可能略有差异，所以这里做多级兜底：
-  /// 省优先取 [administrativeArea]，市优先取 [locality]，区优先取 [subLocality]。
+  /// 不同 Android 设备和地理编码服务返回字段可能略有差异，所以这里做多级兜底。
+  ///
+  /// 真机上常见情况是 [subAdministrativeArea] 返回“市”，[locality] 返回“区/县”；
+  /// 如果简单把 locality 当作市，会导致地址表里的市和区写反。
   AddressRecord _buildAddressRecord(Position position, Placemark placemark) {
     final province = _firstNotEmpty([
       placemark.administrativeArea,
       placemark.locality,
     ]);
-    final city = _firstNotEmpty([
-      placemark.locality,
-      placemark.subAdministrativeArea,
-      placemark.administrativeArea,
-    ]);
-    final district = _firstNotEmpty([
-      placemark.subLocality,
-      placemark.subAdministrativeArea,
-      placemark.locality,
-    ]);
+    final city = _selectCity(placemark, province);
+    final district = _selectDistrict(placemark, city);
     final detailAddress = _joinAddressParts([
       placemark.country,
       province,
@@ -124,6 +148,82 @@ class LocationAddressService {
       detailAddress: detailAddress,
       createdAt: DateTime.now(),
     );
+  }
+
+  /// 选择市级行政区。
+  ///
+  /// Android 真机上 [subAdministrativeArea] 更稳定地表示市级；如果它为空，再从
+  /// locality 等字段兜底，并优先选择带“市/州/盟/地区”的名称。
+  String _selectCity(Placemark placemark, String province) {
+    final candidates = [
+      placemark.subAdministrativeArea,
+      placemark.locality,
+      placemark.administrativeArea,
+    ];
+    return _firstMatching(candidates, _looksLikeCity) ??
+        _firstDifferentNotEmpty(candidates, province) ??
+        province;
+  }
+
+  /// 选择区县级行政区。
+  ///
+  /// [locality] 在部分国产 ROM 上会返回区县名，所以这里优先识别“区/县/旗”等
+  /// 区县级后缀；同时排除已经选中的市名，避免市区重复或写反。
+  String _selectDistrict(Placemark placemark, String city) {
+    final candidates = [
+      placemark.locality,
+      placemark.subLocality,
+      placemark.subAdministrativeArea,
+    ];
+    return _firstMatching(
+          candidates,
+          (value) => value != city && _looksLikeDistrict(value),
+        ) ??
+        _firstDifferentNotEmpty(candidates, city) ??
+        city;
+  }
+
+  String? _firstMatching(
+    List<String?> values,
+    bool Function(String value) test,
+  ) {
+    for (final value in values) {
+      final normalizedValue = value?.trim();
+      if (normalizedValue != null &&
+          normalizedValue.isNotEmpty &&
+          test(normalizedValue)) {
+        return normalizedValue;
+      }
+    }
+    return null;
+  }
+
+  String? _firstDifferentNotEmpty(List<String?> values, String excludedValue) {
+    for (final value in values) {
+      final normalizedValue = value?.trim();
+      if (normalizedValue != null &&
+          normalizedValue.isNotEmpty &&
+          normalizedValue != excludedValue) {
+        return normalizedValue;
+      }
+    }
+    return null;
+  }
+
+  bool _looksLikeCity(String value) {
+    return value.endsWith('市') ||
+        value.endsWith('州') ||
+        value.endsWith('盟') ||
+        value.endsWith('地区');
+  }
+
+  bool _looksLikeDistrict(String value) {
+    return value.endsWith('区') ||
+        value.endsWith('县') ||
+        value.endsWith('旗') ||
+        value.endsWith('自治县') ||
+        value.endsWith('林区') ||
+        value.endsWith('特区');
   }
 
   /// 从候选字段中取第一个非空字符串，所有候选都为空时返回空字符串。
