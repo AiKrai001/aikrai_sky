@@ -8,6 +8,7 @@ import '../services/address_database_service.dart';
 import '../services/caiyun_weather_service.dart';
 import '../services/location_address_service.dart';
 import 'address_records_page.dart';
+import 'location_management_page.dart';
 import 'weather_records_page.dart';
 
 /// 天气首页。
@@ -314,6 +315,39 @@ class _WeatherHomePageState extends State<WeatherHomePage>
     return result;
   }
 
+  Future<void> _reloadAddressPagesFromStorage() async {
+    final addresses = await AddressDatabaseService.instance
+        .fetchAllAddressRecords();
+    final savedWeatherByAddressId = await _loadSavedWeatherDataForAddresses(
+      addresses,
+    );
+    if (!mounted) {
+      return;
+    }
+
+    final selectedAddressId =
+        _currentLocatedAddressId ?? _weatherData?.address.id;
+    final selectedIndex = _indexOfAddress(selectedAddressId, addresses);
+    final selectedAddress = addresses.isEmpty ? null : addresses[selectedIndex];
+    final selectedWeatherData = selectedAddress?.id == null
+        ? null
+        : savedWeatherByAddressId[selectedAddress!.id];
+    final fallbackWeatherData = savedWeatherByAddressId.isEmpty
+        ? null
+        : savedWeatherByAddressId.values.first;
+
+    setState(() {
+      _addresses = addresses;
+      _selectedAddressIndex = selectedIndex;
+      _weatherDataByAddressId
+        ..clear()
+        ..addAll(savedWeatherByAddressId);
+      _weatherData = selectedWeatherData ?? fallbackWeatherData;
+      _statusText = addresses.isEmpty ? '暂无位置，请添加位置。' : '位置已更新';
+    });
+    _scheduleAddressPageSync();
+  }
+
   int _indexOfAddress(int? addressId, List<AddressRecord> addresses) {
     if (addressId == null) {
       return 0;
@@ -387,11 +421,27 @@ class _WeatherHomePageState extends State<WeatherHomePage>
             SafeArea(
               bottom: false,
               child: pageAddresses.isEmpty
-                  ? RefreshIndicator(
-                      color: Colors.white,
-                      backgroundColor: Colors.black26,
-                      onRefresh: () => _refreshWeather(triggerSource: '下拉刷新'),
-                      child: _EmptyWeatherView(statusText: _statusText),
+                  ? Stack(
+                      children: [
+                        RefreshIndicator(
+                          color: Colors.white,
+                          backgroundColor: Colors.black26,
+                          onRefresh: () =>
+                              _refreshWeather(triggerSource: '下拉刷新'),
+                          child: _EmptyWeatherView(statusText: _statusText),
+                        ),
+                        Positioned(
+                          left: 18,
+                          top: 10,
+                          child: IconButton(
+                            tooltip: '管理位置',
+                            iconSize: 30,
+                            color: Colors.white,
+                            icon: const Icon(Icons.add),
+                            onPressed: _openLocationManagementPage,
+                          ),
+                        ),
+                      ],
                     )
                   : PageView.builder(
                       controller: _addressPageController,
@@ -420,6 +470,7 @@ class _WeatherHomePageState extends State<WeatherHomePage>
                           isLoading: _isLoading && index == safeSelectedIndex,
                           onRefresh: () =>
                               _refreshWeather(triggerSource: '下拉刷新'),
+                          onManageLocations: _openLocationManagementPage,
                           onManualRefresh: () =>
                               _refreshWeather(triggerSource: '手动刷新'),
                           onMenuAction: _handleMenuAction,
@@ -447,6 +498,20 @@ class _WeatherHomePageState extends State<WeatherHomePage>
         );
     }
   }
+
+  Future<void> _openLocationManagementPage() async {
+    final changed = await Navigator.of(context).push<bool>(
+      MaterialPageRoute<bool>(
+        builder: (_) => LocationManagementPage(
+          currentLocatedAddressId: _currentLocatedAddressId,
+          currentLocatedAddress: _currentLocatedAddress,
+        ),
+      ),
+    );
+    if (changed == true) {
+      await _reloadAddressPagesFromStorage();
+    }
+  }
 }
 
 enum _WeatherMenuAction { refresh, addressTable, weatherTable }
@@ -462,6 +527,7 @@ class _WeatherAddressPage extends StatefulWidget {
     required this.statusText,
     required this.isLoading,
     required this.onRefresh,
+    required this.onManageLocations,
     required this.onManualRefresh,
     required this.onMenuAction,
   });
@@ -475,6 +541,7 @@ class _WeatherAddressPage extends StatefulWidget {
   final String statusText;
   final bool isLoading;
   final Future<void> Function() onRefresh;
+  final VoidCallback onManageLocations;
   final VoidCallback onManualRefresh;
   final ValueChanged<_WeatherMenuAction> onMenuAction;
 
@@ -510,7 +577,7 @@ class _WeatherAddressPageState extends State<_WeatherAddressPage>
                     currentLocatedAddress: widget.currentLocatedAddress,
                     statusText: widget.statusText,
                     isLoading: widget.isLoading,
-                    onRefresh: widget.onManualRefresh,
+                    onManageLocations: widget.onManageLocations,
                     onMenuAction: widget.onMenuAction,
                   ),
                 ],
@@ -527,7 +594,7 @@ class _WeatherAddressPageState extends State<_WeatherAddressPage>
                     currentLocatedAddressId: widget.currentLocatedAddressId,
                     currentLocatedAddress: widget.currentLocatedAddress,
                     isLoading: widget.isLoading,
-                    onRefresh: widget.onManualRefresh,
+                    onManageLocations: widget.onManageLocations,
                     onMenuAction: widget.onMenuAction,
                   ),
                   const SizedBox(height: 16),
@@ -557,7 +624,7 @@ class _AddressWeatherPlaceholder extends StatelessWidget {
     required this.currentLocatedAddress,
     required this.statusText,
     required this.isLoading,
-    required this.onRefresh,
+    required this.onManageLocations,
     required this.onMenuAction,
   });
 
@@ -568,7 +635,7 @@ class _AddressWeatherPlaceholder extends StatelessWidget {
   final AddressRecord? currentLocatedAddress;
   final String statusText;
   final bool isLoading;
-  final VoidCallback onRefresh;
+  final VoidCallback onManageLocations;
   final ValueChanged<_WeatherMenuAction> onMenuAction;
 
   @override
@@ -587,7 +654,7 @@ class _AddressWeatherPlaceholder extends StatelessWidget {
             currentLocatedAddressId: currentLocatedAddressId,
             currentLocatedAddress: currentLocatedAddress,
             isLoading: isLoading,
-            onRefresh: onRefresh,
+            onManageLocations: onManageLocations,
             onMenuAction: onMenuAction,
           ),
           Expanded(
@@ -614,7 +681,7 @@ class _CurrentWeatherHero extends StatelessWidget {
     required this.currentLocatedAddressId,
     required this.currentLocatedAddress,
     required this.isLoading,
-    required this.onRefresh,
+    required this.onManageLocations,
     required this.onMenuAction,
   });
 
@@ -624,7 +691,7 @@ class _CurrentWeatherHero extends StatelessWidget {
   final int? currentLocatedAddressId;
   final AddressRecord? currentLocatedAddress;
   final bool isLoading;
-  final VoidCallback onRefresh;
+  final VoidCallback onManageLocations;
   final ValueChanged<_WeatherMenuAction> onMenuAction;
 
   @override
@@ -645,7 +712,7 @@ class _CurrentWeatherHero extends StatelessWidget {
             currentLocatedAddressId: currentLocatedAddressId,
             currentLocatedAddress: currentLocatedAddress,
             isLoading: isLoading,
-            onRefresh: onRefresh,
+            onManageLocations: onManageLocations,
             onMenuAction: onMenuAction,
           ),
           const Spacer(),
@@ -787,7 +854,7 @@ class _WeatherTopBar extends StatelessWidget {
     required this.currentLocatedAddressId,
     required this.currentLocatedAddress,
     required this.isLoading,
-    required this.onRefresh,
+    required this.onManageLocations,
     required this.onMenuAction,
   });
 
@@ -797,7 +864,7 @@ class _WeatherTopBar extends StatelessWidget {
   final int? currentLocatedAddressId;
   final AddressRecord? currentLocatedAddress;
   final bool isLoading;
-  final VoidCallback onRefresh;
+  final VoidCallback onManageLocations;
   final ValueChanged<_WeatherMenuAction> onMenuAction;
 
   @override
@@ -813,20 +880,11 @@ class _WeatherTopBar extends StatelessWidget {
           Align(
             alignment: Alignment.topLeft,
             child: IconButton(
-              tooltip: '刷新天气',
-              onPressed: isLoading ? null : onRefresh,
+              tooltip: '管理位置',
+              onPressed: onManageLocations,
               iconSize: 30,
               color: Colors.white,
-              icon: isLoading
-                  ? const SizedBox(
-                      width: 24,
-                      height: 24,
-                      child: CircularProgressIndicator(
-                        strokeWidth: 2.2,
-                        color: Colors.white,
-                      ),
-                    )
-                  : const Icon(Icons.add),
+              icon: const Icon(Icons.add),
             ),
           ),
           Align(

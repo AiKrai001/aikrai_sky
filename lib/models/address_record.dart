@@ -1,7 +1,7 @@
 /// 本地地址表的一条记录。
 ///
 /// 这个模型只承载“定位结果落库”这一步需要的字段：
-/// 经纬度、省、市、区、详细地址、创建时间和更新时间。后续天气接口需要查询当前位置时，
+/// 经纬度、省、市、区、详细地址、排序、创建时间和更新时间。后续天气接口需要查询当前位置时，
 /// 可以直接读取最新一条地址记录，避免重复定义地址数据结构。
 class AddressRecord {
   const AddressRecord({
@@ -12,6 +12,7 @@ class AddressRecord {
     required this.city,
     required this.district,
     required this.detailAddress,
+    required this.sortOrder,
     required this.createdAt,
     required this.updatedAt,
   });
@@ -37,6 +38,9 @@ class AddressRecord {
   /// 平台反地理编码返回的可读地址，尽量拼接到街道/门牌级别。
   final String detailAddress;
 
+  /// 位置管理页中的排序值，数值越小越靠前。
+  final int sortOrder;
+
   /// 记录创建时间，使用本机当前时间。
   final DateTime createdAt;
 
@@ -54,6 +58,7 @@ class AddressRecord {
   static const columnCity = 'city';
   static const columnDistrict = 'district';
   static const columnDetailAddress = 'detail_address';
+  static const columnSortOrder = 'sort_order';
   static const columnCreatedAt = 'created_at';
   static const columnUpdatedAt = 'updated_at';
 
@@ -70,6 +75,7 @@ class AddressRecord {
       columnCity: city,
       columnDistrict: district,
       columnDetailAddress: detailAddress,
+      columnSortOrder: sortOrder,
       columnCreatedAt: createdAt.toIso8601String(),
       columnUpdatedAt: updatedAt.toIso8601String(),
     };
@@ -85,6 +91,7 @@ class AddressRecord {
       city: map[columnCity] as String,
       district: map[columnDistrict] as String,
       detailAddress: map[columnDetailAddress] as String,
+      sortOrder: (map[columnSortOrder] as num?)?.toInt() ?? 0,
       createdAt: DateTime.parse(map[columnCreatedAt] as String),
       updatedAt: DateTime.parse(
         (map[columnUpdatedAt] ?? map[columnCreatedAt]) as String,
@@ -104,6 +111,7 @@ class AddressRecord {
     String? city,
     String? district,
     String? detailAddress,
+    int? sortOrder,
     DateTime? createdAt,
     DateTime? updatedAt,
   }) {
@@ -115,6 +123,7 @@ class AddressRecord {
       city: city ?? this.city,
       district: district ?? this.district,
       detailAddress: detailAddress ?? this.detailAddress,
+      sortOrder: sortOrder ?? this.sortOrder,
       createdAt: createdAt ?? this.createdAt,
       updatedAt: updatedAt ?? this.updatedAt,
     );

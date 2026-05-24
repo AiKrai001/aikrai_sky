@@ -15,7 +15,7 @@ class AddressDatabaseService {
   static final AddressDatabaseService instance = AddressDatabaseService._();
 
   static const _databaseName = 'aikrai_sky.db';
-  static const _databaseVersion = 3;
+  static const _databaseVersion = 4;
 
   Database? _database;
 
@@ -32,11 +32,17 @@ class AddressDatabaseService {
     final openedDatabase = await openDatabase(
       databasePath,
       version: _databaseVersion,
+      onConfigure: _configureDatabase,
       onCreate: _createDatabase,
       onUpgrade: _upgradeDatabase,
     );
     _database = openedDatabase;
     return openedDatabase;
+  }
+
+  /// 打开外键约束，让地址删除时关联天气数据的约束行为保持一致。
+  Future<void> _configureDatabase(Database db) async {
+    await db.execute('PRAGMA foreign_keys = ON');
   }
 
   /// 创建地址表。
@@ -51,8 +57,8 @@ class AddressDatabaseService {
   ///
   /// 处理旧版本升级。
   ///
-  /// 当前开发阶段地址表结构变化通过卸载重装重建数据库处理，因此这里只保留
-  /// 既有 v1 到 v2 的天气表补建逻辑，不再迁移旧地址表字段。
+  /// 当前开发阶段大结构变化仍可通过卸载重装处理；这里补充轻量列迁移，
+  /// 方便开发机直接覆盖安装后继续调试位置排序。
   Future<void> _upgradeDatabase(
     Database db,
     int oldVersion,
@@ -60,6 +66,9 @@ class AddressDatabaseService {
   ) async {
     if (oldVersion < 2) {
       await _createWeatherDataTable(db);
+    }
+    if (oldVersion < 4) {
+      await _addAddressSortOrderColumn(db);
     }
   }
 
@@ -74,9 +83,32 @@ class AddressDatabaseService {
         ${AddressRecord.columnCity} TEXT NOT NULL,
         ${AddressRecord.columnDistrict} TEXT NOT NULL,
         ${AddressRecord.columnDetailAddress} TEXT NOT NULL,
+        ${AddressRecord.columnSortOrder} INTEGER NOT NULL,
         ${AddressRecord.columnCreatedAt} TEXT NOT NULL,
         ${AddressRecord.columnUpdatedAt} TEXT NOT NULL
       )
+    ''');
+  }
+
+  /// v4 迁移：给地址表补充手动排序字段。
+  Future<void> _addAddressSortOrderColumn(Database db) async {
+    final columns = await db.rawQuery(
+      'PRAGMA table_info(${AddressRecord.tableName})',
+    );
+    final hasSortOrderColumn = columns.any(
+      (column) => column['name'] == AddressRecord.columnSortOrder,
+    );
+    if (hasSortOrderColumn) {
+      return;
+    }
+
+    await db.execute('''
+      ALTER TABLE ${AddressRecord.tableName}
+      ADD COLUMN ${AddressRecord.columnSortOrder} INTEGER NOT NULL DEFAULT 0
+    ''');
+    await db.execute('''
+      UPDATE ${AddressRecord.tableName}
+      SET ${AddressRecord.columnSortOrder} = ${AddressRecord.columnId}
     ''');
   }
 
@@ -111,12 +143,25 @@ class AddressDatabaseService {
   /// 插入一条地址记录，并返回带自增主键的完整对象。
   Future<AddressRecord> insertAddress(AddressRecord address) async {
     final db = await database;
+    final addressToInsert = address.sortOrder < 0
+        ? address.copyWith(sortOrder: await _nextAddressSortOrder(db))
+        : address;
     final id = await db.insert(
       AddressRecord.tableName,
-      address.toMap(),
+      addressToInsert.toMap(),
       conflictAlgorithm: ConflictAlgorithm.abort,
     );
-    return address.copyWith(id: id);
+    return addressToInsert.copyWith(id: id);
+  }
+
+  /// 获取下一个排序值，让新位置默认追加到列表底部。
+  Future<int> _nextAddressSortOrder(Database db) async {
+    final rows = await db.rawQuery('''
+      SELECT MAX(${AddressRecord.columnSortOrder}) AS max_sort_order
+      FROM ${AddressRecord.tableName}
+    ''');
+    final maxSortOrder = Sqflite.firstIntValue(rows);
+    return (maxSortOrder ?? -1) + 1;
   }
 
   /// 按区保存地址记录。
@@ -138,6 +183,7 @@ class AddressDatabaseService {
     final updatedAddress = address.copyWith(
       id: existingAddress.id,
       createdAt: existingAddress.createdAt,
+      sortOrder: existingAddress.sortOrder,
       updatedAt: DateTime.now(),
     );
     final values = updatedAddress.toMap()..remove(AddressRecord.columnId);
@@ -207,7 +253,7 @@ class AddressDatabaseService {
     final db = await database;
     final rows = await db.query(
       AddressRecord.tableName,
-      orderBy: '${AddressRecord.columnCreatedAt} DESC',
+      orderBy: '${AddressRecord.columnUpdatedAt} DESC',
       limit: 1,
     );
 
@@ -248,7 +294,9 @@ class AddressDatabaseService {
     final db = await database;
     final rows = await db.query(
       AddressRecord.tableName,
-      orderBy: '${AddressRecord.columnUpdatedAt} DESC',
+      orderBy:
+          '${AddressRecord.columnSortOrder} ASC, '
+          '${AddressRecord.columnUpdatedAt} DESC',
     );
 
     return rows.map(AddressRecord.fromMap).toList();
@@ -265,6 +313,42 @@ class AddressDatabaseService {
       ''', dateRange?.whereArgs);
 
     return Sqflite.firstIntValue(rows) ?? 0;
+  }
+
+  /// 按用户拖动后的顺序批量更新地址排序。
+  Future<void> updateAddressSortOrders(List<AddressRecord> addresses) async {
+    final db = await database;
+    await db.transaction((txn) async {
+      for (var index = 0; index < addresses.length; index += 1) {
+        final addressId = addresses[index].id;
+        if (addressId == null) {
+          continue;
+        }
+        await txn.update(
+          AddressRecord.tableName,
+          {AddressRecord.columnSortOrder: index},
+          where: '${AddressRecord.columnId} = ?',
+          whereArgs: [addressId],
+        );
+      }
+    });
+  }
+
+  /// 删除一个位置，并同步删除它关联的天气记录。
+  Future<void> deleteAddressById(int addressId) async {
+    final db = await database;
+    await db.transaction((txn) async {
+      await txn.delete(
+        WeatherRecord.tableName,
+        where: '${WeatherRecord.columnAddressId} = ?',
+        whereArgs: [addressId],
+      );
+      await txn.delete(
+        AddressRecord.tableName,
+        where: '${AddressRecord.columnId} = ?',
+        whereArgs: [addressId],
+      );
+    });
   }
 
   /// 按“地址 id + 日期”保存天气原始数据。

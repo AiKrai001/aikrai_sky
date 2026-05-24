@@ -186,6 +186,7 @@ class _AddressRecordCard extends StatelessWidget {
       ('市', record.city),
       ('区', record.district),
       ('详细地址', record.detailAddress),
+      ('排序', '${record.sortOrder}'),
       ('创建时间', record.createdAt.toLocal().toString()),
       ('更新时间', record.updatedAt.toLocal().toString()),
     ];
