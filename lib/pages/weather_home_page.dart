@@ -14,7 +14,7 @@ import 'weather_records_page.dart';
 /// 天气首页。
 ///
 /// 页面从上到下展示：当前天气、近 24 小时、近 7 天、空气质量、生活指数。
-/// 启动和从后台回到前台时会刷新定位与天气数据。
+/// 启动、下拉刷新、点击刷新时会重新获取定位与天气数据。
 class WeatherHomePage extends StatefulWidget {
   const WeatherHomePage({super.key});
 
@@ -22,8 +22,7 @@ class WeatherHomePage extends StatefulWidget {
   State<WeatherHomePage> createState() => _WeatherHomePageState();
 }
 
-class _WeatherHomePageState extends State<WeatherHomePage>
-    with WidgetsBindingObserver {
+class _WeatherHomePageState extends State<WeatherHomePage> {
   static const _defaultBackground = WeatherBackgroundStyle(
     topColor: 0xFF4DA1D9,
     bottomColor: 0xFF226A9A,
@@ -50,7 +49,6 @@ class _WeatherHomePageState extends State<WeatherHomePage>
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addObserver(this);
     _loadSavedWeather();
     _refreshWeather(triggerSource: '应用启动');
   }
@@ -59,16 +57,7 @@ class _WeatherHomePageState extends State<WeatherHomePage>
   void dispose() {
     _addressPageController.dispose();
     _backgroundStyle.dispose();
-    WidgetsBinding.instance.removeObserver(this);
     super.dispose();
-  }
-
-  @override
-  void didChangeAppLifecycleState(AppLifecycleState state) {
-    super.didChangeAppLifecycleState(state);
-    if (state == AppLifecycleState.resumed) {
-      _refreshWeather(triggerSource: '回到前台');
-    }
   }
 
   /// 先展示本地已保存的最新天气，避免启动时页面长时间空白。
