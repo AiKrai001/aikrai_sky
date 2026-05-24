@@ -1,7 +1,7 @@
 /// 本地地址表的一条记录。
 ///
 /// 这个模型只承载“定位结果落库”这一步需要的字段：
-/// 经纬度、省、市、区、详细地址和创建时间。后续天气接口需要查询当前位置时，
+/// 经纬度、省、市、区、详细地址、创建时间和更新时间。后续天气接口需要查询当前位置时，
 /// 可以直接读取最新一条地址记录，避免重复定义地址数据结构。
 class AddressRecord {
   const AddressRecord({
@@ -13,6 +13,7 @@ class AddressRecord {
     required this.district,
     required this.detailAddress,
     required this.createdAt,
+    required this.updatedAt,
   });
 
   /// SQLite 自增主键；新记录入库前为空，入库后由数据库生成。
@@ -39,6 +40,9 @@ class AddressRecord {
   /// 记录创建时间，使用本机当前时间。
   final DateTime createdAt;
 
+  /// 记录更新时间；同一区再次定位时会刷新该字段。
+  final DateTime updatedAt;
+
   /// 数据库表名集中放在模型中，避免服务层和查询层硬编码多份字符串。
   static const tableName = 'addresses';
 
@@ -51,10 +55,11 @@ class AddressRecord {
   static const columnDistrict = 'district';
   static const columnDetailAddress = 'detail_address';
   static const columnCreatedAt = 'created_at';
+  static const columnUpdatedAt = 'updated_at';
 
   /// 将 Dart 对象转换为 SQLite 可写入的 Map。
   ///
-  /// [id] 为空时不写入主键，让 SQLite 自动生成；[createdAt] 使用 ISO8601
+  /// [id] 为空时不写入主键，让 SQLite 自动生成；时间字段使用 ISO8601
   /// 字符串保存，便于排序、调试以及未来跨端同步。
   Map<String, Object?> toMap() {
     return {
@@ -66,6 +71,7 @@ class AddressRecord {
       columnDistrict: district,
       columnDetailAddress: detailAddress,
       columnCreatedAt: createdAt.toIso8601String(),
+      columnUpdatedAt: updatedAt.toIso8601String(),
     };
   }
 
@@ -80,20 +86,37 @@ class AddressRecord {
       district: map[columnDistrict] as String,
       detailAddress: map[columnDetailAddress] as String,
       createdAt: DateTime.parse(map[columnCreatedAt] as String),
+      updatedAt: DateTime.parse(
+        (map[columnUpdatedAt] ?? map[columnCreatedAt]) as String,
+      ),
     );
   }
 
-  /// 生成带新主键的副本，方便插入数据库后把自增 id 回填给 UI。
-  AddressRecord copyWith({int? id}) {
+  /// 生成字段可替换的副本。
+  ///
+  /// 插入数据库后可用它回填自增 id；同一区再次定位时也可保留原 id，
+  /// 同时更新经纬度、省市区和详细地址。
+  AddressRecord copyWith({
+    int? id,
+    double? latitude,
+    double? longitude,
+    String? province,
+    String? city,
+    String? district,
+    String? detailAddress,
+    DateTime? createdAt,
+    DateTime? updatedAt,
+  }) {
     return AddressRecord(
       id: id ?? this.id,
-      latitude: latitude,
-      longitude: longitude,
-      province: province,
-      city: city,
-      district: district,
-      detailAddress: detailAddress,
-      createdAt: createdAt,
+      latitude: latitude ?? this.latitude,
+      longitude: longitude ?? this.longitude,
+      province: province ?? this.province,
+      city: city ?? this.city,
+      district: district ?? this.district,
+      detailAddress: detailAddress ?? this.detailAddress,
+      createdAt: createdAt ?? this.createdAt,
+      updatedAt: updatedAt ?? this.updatedAt,
     );
   }
 }

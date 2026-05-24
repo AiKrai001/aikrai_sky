@@ -43,17 +43,8 @@ class LocationAddressService {
     );
 
     final placemark = await _reverseGeocode(position);
-    final address = _buildAddressRecord(position, placemark);
-    final existingAddress = await _database.fetchAddressByCoordinates(
-      latitude: address.latitude,
-      longitude: address.longitude,
-    );
-
-    if (existingAddress != null) {
-      return existingAddress;
-    }
-
-    return _database.insertAddress(address);
+    final address = buildAddressRecord(position, placemark);
+    return _database.upsertAddressByDistrict(address);
   }
 
   /// 检查系统定位服务和运行时权限。
@@ -115,19 +106,30 @@ class LocationAddressService {
     }
   }
 
-  /// 把平台返回的 Placemark 映射为项目地址表字段。
+  /// 把平台返回的 [Placemark] 映射成地址表记录。
   ///
   /// 不同 Android 设备和地理编码服务返回字段可能略有差异，所以这里做多级兜底。
-  ///
   /// 真机上常见情况是 [subAdministrativeArea] 返回“市”，[locality] 返回“区/县”；
   /// 如果简单把 locality 当作市，会导致地址表里的市和区写反。
-  AddressRecord _buildAddressRecord(Position position, Placemark placemark) {
+  ///
+  /// 该方法保持公开，方便单元测试直接覆盖不同国家/地区返回字段的组合；
+  /// 页面业务仍只需要调用 [captureAndSaveCurrentAddress]。
+  AddressRecord buildAddressRecord(Position position, Placemark placemark) {
+    final now = DateTime.now();
+    final isChina = _isChinaPlacemark(placemark);
     final province = _firstNotEmpty([
       placemark.administrativeArea,
+      placemark.subAdministrativeArea,
       placemark.locality,
+      placemark.country,
     ]);
-    final city = _selectCity(placemark, province);
-    final district = _selectDistrict(placemark, city);
+    final city = _selectCity(placemark, province, isChina: isChina);
+    final district = _selectDistrict(
+      placemark,
+      city,
+      province,
+      isChina: isChina,
+    );
     final detailAddress = _joinAddressParts([
       placemark.country,
       province,
@@ -146,30 +148,66 @@ class LocationAddressService {
       city: city,
       district: district,
       detailAddress: detailAddress,
-      createdAt: DateTime.now(),
+      createdAt: now,
+      updatedAt: now,
     );
   }
 
   /// 选择市级行政区。
   ///
-  /// Android 真机上 [subAdministrativeArea] 更稳定地表示市级；如果它为空，再从
-  /// locality 等字段兜底，并优先选择带“市/州/盟/地区”的名称。
-  String _selectCity(Placemark placemark, String province) {
+  /// 国内优先识别“市/州/盟/地区”等中文行政后缀；海外地址通常没有这些后缀，
+  /// 因此按 locality（城市）优先，再用 subAdministrativeArea 等字段兜底。
+  String _selectCity(
+    Placemark placemark,
+    String province, {
+    required bool isChina,
+  }) {
+    if (!isChina) {
+      return _firstDifferentNotEmpty(
+            [
+              placemark.locality,
+              placemark.subAdministrativeArea,
+              placemark.subLocality,
+              placemark.administrativeArea,
+            ],
+            [province],
+          ) ??
+          province;
+    }
+
     final candidates = [
       placemark.subAdministrativeArea,
       placemark.locality,
       placemark.administrativeArea,
     ];
     return _firstMatching(candidates, _looksLikeCity) ??
-        _firstDifferentNotEmpty(candidates, province) ??
+        _firstDifferentNotEmpty(candidates, [province]) ??
         province;
   }
 
   /// 选择区县级行政区。
   ///
   /// [locality] 在部分国产 ROM 上会返回区县名，所以这里优先识别“区/县/旗”等
-  /// 区县级后缀；同时排除已经选中的市名，避免市区重复或写反。
-  String _selectDistrict(Placemark placemark, String city) {
+  /// 区县级后缀；海外地址则优先用 subLocality，不存在时退到县/郡、市或省。
+  String _selectDistrict(
+    Placemark placemark,
+    String city,
+    String province, {
+    required bool isChina,
+  }) {
+    if (!isChina) {
+      return _firstDifferentNotEmpty(
+            [
+              placemark.subLocality,
+              placemark.subAdministrativeArea,
+              placemark.locality,
+              placemark.administrativeArea,
+            ],
+            [city, province],
+          ) ??
+          _firstNotEmpty([city, province]);
+    }
+
     final candidates = [
       placemark.locality,
       placemark.subLocality,
@@ -177,9 +215,10 @@ class LocationAddressService {
     ];
     return _firstMatching(
           candidates,
-          (value) => value != city && _looksLikeDistrict(value),
+          (value) =>
+              value != city && value != province && _looksLikeDistrict(value),
         ) ??
-        _firstDifferentNotEmpty(candidates, city) ??
+        _firstDifferentNotEmpty(candidates, [city, province]) ??
         city;
   }
 
@@ -198,16 +237,33 @@ class LocationAddressService {
     return null;
   }
 
-  String? _firstDifferentNotEmpty(List<String?> values, String excludedValue) {
+  String? _firstDifferentNotEmpty(
+    List<String?> values,
+    List<String> excludedValues,
+  ) {
+    final normalizedExcludedValues = excludedValues
+        .map((value) => value.trim())
+        .where((value) => value.isNotEmpty)
+        .toSet();
+
     for (final value in values) {
       final normalizedValue = value?.trim();
       if (normalizedValue != null &&
           normalizedValue.isNotEmpty &&
-          normalizedValue != excludedValue) {
+          !normalizedExcludedValues.contains(normalizedValue)) {
         return normalizedValue;
       }
     }
     return null;
+  }
+
+  bool _isChinaPlacemark(Placemark placemark) {
+    final countryCode = placemark.isoCountryCode?.trim().toUpperCase();
+    final country = placemark.country?.trim().toLowerCase();
+    return countryCode == 'CN' ||
+        country == '中国' ||
+        country == '中华人民共和国' ||
+        country == 'china';
   }
 
   bool _looksLikeCity(String value) {

@@ -8,6 +8,39 @@ import 'package:aikrai_sky/models/weather_display_data.dart';
 import 'package:aikrai_sky/models/weather_record.dart';
 
 void main() {
+  test(
+    'AddressRecord copyWith keeps identity while replacing address fields',
+    () {
+      final createdAt = DateTime(2026, 5, 24, 9);
+      final original = AddressRecord(
+        id: 7,
+        latitude: 31.2646001,
+        longitude: 121.5051001,
+        province: '上海市',
+        city: '上海市',
+        district: '虹口区',
+        detailAddress: '上海市虹口区旧地址',
+        sortOrder: 0,
+        createdAt: createdAt,
+        updatedAt: createdAt,
+      );
+
+      final updated = original.copyWith(
+        latitude: 31.2646999,
+        longitude: 121.5051999,
+        detailAddress: '上海市虹口区新地址',
+      );
+
+      expect(updated.id, 7);
+      expect(updated.createdAt, createdAt);
+      expect(updated.updatedAt, createdAt);
+      expect(updated.district, '虹口区');
+      expect(updated.latitude, 31.2646999);
+      expect(updated.longitude, 121.5051999);
+      expect(updated.detailAddress, '上海市虹口区新地址');
+    },
+  );
+
   test('CaiyunWeatherResponse parses common weather nodes', () {
     final rawJson = jsonEncode({
       'status': 'ok',

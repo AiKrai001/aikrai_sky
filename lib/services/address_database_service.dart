@@ -15,7 +15,7 @@ class AddressDatabaseService {
   static final AddressDatabaseService instance = AddressDatabaseService._();
 
   static const _databaseName = 'aikrai_sky.db';
-  static const _databaseVersion = 2;
+  static const _databaseVersion = 3;
 
   Database? _database;
 
@@ -41,7 +41,7 @@ class AddressDatabaseService {
 
   /// 创建地址表。
   ///
-  /// [created_at] 使用文本保存 ISO8601 时间，按字符串倒序即可得到最新记录。
+  /// 时间字段使用文本保存 ISO8601 时间，按字符串倒序即可得到最新记录。
   Future<void> _createDatabase(Database db, int version) async {
     await _createAddressTable(db);
     await _createWeatherDataTable(db);
@@ -49,7 +49,10 @@ class AddressDatabaseService {
 
   /// 处理数据库升级。
   ///
-  /// v1 只有地址表；v2 新增天气数据表，不影响已有地址记录。
+  /// 处理旧版本升级。
+  ///
+  /// 当前开发阶段地址表结构变化通过卸载重装重建数据库处理，因此这里只保留
+  /// 既有 v1 到 v2 的天气表补建逻辑，不再迁移旧地址表字段。
   Future<void> _upgradeDatabase(
     Database db,
     int oldVersion,
@@ -71,7 +74,8 @@ class AddressDatabaseService {
         ${AddressRecord.columnCity} TEXT NOT NULL,
         ${AddressRecord.columnDistrict} TEXT NOT NULL,
         ${AddressRecord.columnDetailAddress} TEXT NOT NULL,
-        ${AddressRecord.columnCreatedAt} TEXT NOT NULL
+        ${AddressRecord.columnCreatedAt} TEXT NOT NULL,
+        ${AddressRecord.columnUpdatedAt} TEXT NOT NULL
       )
     ''');
   }
@@ -115,10 +119,68 @@ class AddressDatabaseService {
     return address.copyWith(id: id);
   }
 
+  /// 按区保存地址记录。
+  ///
+  /// 定位经纬度末尾会轻微漂移，所以这里不再用经纬度判断是否同一位置。
+  /// 如果地址表里已经存在相同 [district]，保留原 id 和创建时间，只更新本次
+  /// 定位得到的经纬度、省、市、区、详细地址和更新时间；如果不存在则插入新记录。
+  Future<AddressRecord> upsertAddressByDistrict(AddressRecord address) async {
+    final normalizedDistrict = address.district.trim();
+    if (normalizedDistrict.isEmpty) {
+      return insertAddress(address);
+    }
+
+    final existingAddress = await fetchAddressByDistrict(normalizedDistrict);
+    if (existingAddress == null) {
+      return insertAddress(address);
+    }
+
+    final updatedAddress = address.copyWith(
+      id: existingAddress.id,
+      createdAt: existingAddress.createdAt,
+      updatedAt: DateTime.now(),
+    );
+    final values = updatedAddress.toMap()..remove(AddressRecord.columnId);
+    final db = await database;
+    await db.update(
+      AddressRecord.tableName,
+      values,
+      where: '${AddressRecord.columnId} = ?',
+      whereArgs: [existingAddress.id],
+    );
+
+    return updatedAddress;
+  }
+
+  /// 根据区查询已保存的地址记录。
+  ///
+  /// 旧版本可能已经保存了同一区的多条记录；这里取更新时间最新的一条更新，
+  /// 不主动清理旧数据，避免影响已经关联的天气记录。
+  Future<AddressRecord?> fetchAddressByDistrict(String district) async {
+    final normalizedDistrict = district.trim();
+    if (normalizedDistrict.isEmpty) {
+      return null;
+    }
+
+    final db = await database;
+    final rows = await db.query(
+      AddressRecord.tableName,
+      where: '${AddressRecord.columnDistrict} = ?',
+      whereArgs: [normalizedDistrict],
+      orderBy: '${AddressRecord.columnUpdatedAt} DESC',
+      limit: 1,
+    );
+
+    if (rows.isEmpty) {
+      return null;
+    }
+    return AddressRecord.fromMap(rows.first);
+  }
+
   /// 根据经纬度查询已保存的地址记录。
   ///
-  /// 这里按需求判断“相同经纬度”才复用旧记录，因此使用数据库中保存的 double
-  /// 值做精确匹配，不做距离近似或小数截断。
+  /// 该方法保留给调试或旧逻辑兼容；当前定位保存规则已改为按区更新/新增，
+  /// 不再用经纬度末尾数字判断是否同一位置。
   Future<AddressRecord?> fetchAddressByCoordinates({
     required double latitude,
     required double longitude,
@@ -130,7 +192,7 @@ class AddressDatabaseService {
           '${AddressRecord.columnLatitude} = ? AND '
           '${AddressRecord.columnLongitude} = ?',
       whereArgs: [latitude, longitude],
-      orderBy: '${AddressRecord.columnCreatedAt} DESC',
+      orderBy: '${AddressRecord.columnUpdatedAt} DESC',
       limit: 1,
     );
 
@@ -157,8 +219,8 @@ class AddressDatabaseService {
 
   /// 分页查询地址表记录。
   ///
-  /// [date] 为空时查询全部地址；不为空时只查询该本地日期创建的地址记录。
-  /// 数据按创建时间倒序返回，保证页面从新到旧展示。
+  /// [date] 为空时查询全部地址；不为空时只查询该本地日期更新的地址记录。
+  /// 数据按更新时间倒序返回，保证页面从新到旧展示。
   Future<List<AddressRecord>> fetchAddressRecords({
     DateTime? date,
     required int limit,
@@ -170,7 +232,7 @@ class AddressDatabaseService {
       AddressRecord.tableName,
       where: dateRange?.whereClause,
       whereArgs: dateRange?.whereArgs,
-      orderBy: '${AddressRecord.columnCreatedAt} DESC',
+      orderBy: '${AddressRecord.columnUpdatedAt} DESC',
       limit: limit,
       offset: offset,
     );
@@ -186,7 +248,7 @@ class AddressDatabaseService {
     final db = await database;
     final rows = await db.query(
       AddressRecord.tableName,
-      orderBy: '${AddressRecord.columnCreatedAt} DESC',
+      orderBy: '${AddressRecord.columnUpdatedAt} DESC',
     );
 
     return rows.map(AddressRecord.fromMap).toList();
@@ -357,9 +419,9 @@ class AddressDatabaseService {
     return WeatherRecord.fromMap(rows.first);
   }
 
-  /// 构造 created_at 的日期范围查询条件。
+  /// 构造 updated_at 的日期范围查询条件。
   ///
-  /// SQLite 中 created_at 以 ISO8601 字符串保存，所以同一格式的起止时间可以
+  /// SQLite 中 updated_at 以 ISO8601 字符串保存，所以同一格式的起止时间可以
   /// 直接做字符串范围比较，查询某日 00:00:00 到次日 00:00:00 前的记录。
   _DateRangeQuery? _buildDateRange(DateTime? date) {
     if (date == null) {
@@ -372,8 +434,8 @@ class AddressDatabaseService {
 
     return _DateRangeQuery(
       whereClause:
-          '${AddressRecord.columnCreatedAt} >= ? AND '
-          '${AddressRecord.columnCreatedAt} < ?',
+          '${AddressRecord.columnUpdatedAt} >= ? AND '
+          '${AddressRecord.columnUpdatedAt} < ?',
       whereArgs: [start.toIso8601String(), end.toIso8601String()],
     );
   }
