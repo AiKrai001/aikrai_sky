@@ -24,9 +24,18 @@ class WeatherHomePage extends StatefulWidget {
 
 class _WeatherHomePageState extends State<WeatherHomePage>
     with WidgetsBindingObserver {
+  static const _defaultBackground = WeatherBackgroundStyle(
+    topColor: 0xFF4DA1D9,
+    bottomColor: 0xFF226A9A,
+    showRain: false,
+  );
+
   final _locationAddressService = const LocationAddressService();
   final _caiyunWeatherService = const CaiyunWeatherService();
   final _addressPageController = PageController();
+  final _backgroundStyle = ValueNotifier<WeatherBackgroundStyle>(
+    _defaultBackground,
+  );
 
   WeatherDisplayData? _weatherData;
   final Map<int, WeatherDisplayData> _weatherDataByAddressId = {};
@@ -49,6 +58,7 @@ class _WeatherHomePageState extends State<WeatherHomePage>
   @override
   void dispose() {
     _addressPageController.dispose();
+    _backgroundStyle.dispose();
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
@@ -104,6 +114,7 @@ class _WeatherHomePageState extends State<WeatherHomePage>
           ..addAll(savedWeatherByAddressId);
         _statusText = '已读取本地天气，正在刷新...';
       });
+      _backgroundStyle.value = displayData.background;
       _scheduleAddressPageSync();
     } catch (error) {
       _showStatus('读取本地天气失败，正在尝试重新定位：$error');
@@ -165,6 +176,7 @@ class _WeatherHomePageState extends State<WeatherHomePage>
         currentRecord: currentWeather,
         yesterdayRecord: yesterdayWeather,
       );
+      _backgroundStyle.value = displayData.background;
 
       setState(() {
         _addresses = addresses.isEmpty ? [address] : addresses;
@@ -218,27 +230,35 @@ class _WeatherHomePageState extends State<WeatherHomePage>
     _addressSwitchRequestId = requestId;
     final addressTitle = _locationTitle(address);
 
+    final cachedData = _weatherDataByAddressId[addressId];
+    if (cachedData != null) {
+      // 目标页已有完整数据时，只更新业务状态和背景层，不重建整个 PageView。
+      _selectedAddressIndex = index;
+      _weatherData = cachedData;
+      _statusText = '已切换到$addressTitle';
+      _backgroundStyle.value = cachedData.background;
+      return;
+    }
+
     setState(() {
       _selectedAddressIndex = index;
       _statusText = '正在切换到$addressTitle...';
     });
 
-    final cachedData = _weatherDataByAddressId[addressId];
-    if (cachedData != null) {
-      setState(() {
-        _weatherData = cachedData;
-        _statusText = '已切换到$addressTitle';
-      });
-      return;
-    }
-
     try {
+      // 让 PageView 先完成落页绘制，再读取和解析天气数据，减少切页瞬间掉帧。
+      await Future<void>.delayed(const Duration(milliseconds: 80));
+      if (!mounted || requestId != _addressSwitchRequestId) {
+        return;
+      }
+
       final displayData = await _loadWeatherForAddress(address);
 
       if (!mounted || requestId != _addressSwitchRequestId) {
         return;
       }
 
+      _backgroundStyle.value = displayData.background;
       setState(() {
         _weatherData = displayData;
         _weatherDataByAddressId[addressId] = displayData;
@@ -345,6 +365,9 @@ class _WeatherHomePageState extends State<WeatherHomePage>
       _weatherData = selectedWeatherData ?? fallbackWeatherData;
       _statusText = addresses.isEmpty ? '暂无位置，请添加位置。' : '位置已更新';
     });
+    _backgroundStyle.value =
+        (selectedWeatherData ?? fallbackWeatherData)?.background ??
+        _defaultBackground;
     _scheduleAddressPageSync();
   }
 
@@ -388,98 +411,91 @@ class _WeatherHomePageState extends State<WeatherHomePage>
     final safeSelectedIndex = pageAddresses.isEmpty
         ? 0
         : _selectedAddressIndex.clamp(0, pageAddresses.length - 1).toInt();
-    final selectedAddress = pageAddresses.isEmpty
-        ? null
-        : pageAddresses[safeSelectedIndex];
-    final selectedAddressId = selectedAddress?.id;
-    final selectedWeatherData = selectedAddressId == null
-        ? weatherData
-        : _weatherDataByAddressId[selectedAddressId];
-    final background =
-        selectedWeatherData?.background ??
-        weatherData?.background ??
-        const WeatherBackgroundStyle(
-          topColor: 0xFF4DA1D9,
-          bottomColor: 0xFF226A9A,
-          showRain: false,
-        );
+    final pageContent = SafeArea(
+      bottom: false,
+      child: pageAddresses.isEmpty
+          ? Stack(
+              children: [
+                RefreshIndicator(
+                  color: Colors.white,
+                  backgroundColor: Colors.black26,
+                  onRefresh: () => _refreshWeather(triggerSource: '下拉刷新'),
+                  child: _EmptyWeatherView(statusText: _statusText),
+                ),
+                Positioned(
+                  left: 18,
+                  top: 10,
+                  child: IconButton(
+                    tooltip: '管理位置',
+                    iconSize: 30,
+                    color: Colors.white,
+                    icon: const Icon(Icons.add),
+                    onPressed: _openLocationManagementPage,
+                  ),
+                ),
+              ],
+            )
+          : PageView.builder(
+              controller: _addressPageController,
+              allowImplicitScrolling: true,
+              physics: const PageScrollPhysics(parent: ClampingScrollPhysics()),
+              itemCount: pageAddresses.length,
+              onPageChanged: _handleAddressPageChanged,
+              itemBuilder: (context, index) {
+                final address = pageAddresses[index];
+                final addressId = address.id;
+                final pageWeatherData = addressId == null
+                    ? null
+                    : _weatherDataByAddressId[addressId];
+                return _WeatherAddressPage(
+                  address: address,
+                  data: pageWeatherData,
+                  addresses: pageAddresses,
+                  selectedAddressIndex: index,
+                  currentLocatedAddressId: _currentLocatedAddressId,
+                  currentLocatedAddress: _currentLocatedAddress,
+                  statusText: index == safeSelectedIndex
+                      ? _statusText
+                      : '正在读取天气数据...',
+                  isLoading: _isLoading && index == safeSelectedIndex,
+                  onRefresh: () => _refreshWeather(triggerSource: '下拉刷新'),
+                  onManageLocations: _openLocationManagementPage,
+                  onManualRefresh: () =>
+                      _refreshWeather(triggerSource: '手动刷新'),
+                  onMenuAction: _handleMenuAction,
+                );
+              },
+            ),
+    );
 
     return Scaffold(
-      body: DecoratedBox(
-        decoration: BoxDecoration(
-          gradient: LinearGradient(
-            begin: Alignment.topCenter,
-            end: Alignment.bottomCenter,
-            colors: [Color(background.topColor), Color(background.bottomColor)],
-          ),
-        ),
-        child: Stack(
-          children: [
-            Positioned.fill(
-              child: _WeatherSceneBackground(background: background),
+      body: ValueListenableBuilder<WeatherBackgroundStyle>(
+        valueListenable: _backgroundStyle,
+        child: pageContent,
+        builder: (context, background, child) {
+          return AnimatedContainer(
+            duration: const Duration(milliseconds: 260),
+            curve: Curves.easeOutCubic,
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                begin: Alignment.topCenter,
+                end: Alignment.bottomCenter,
+                colors: [
+                  Color(background.topColor),
+                  Color(background.bottomColor),
+                ],
+              ),
             ),
-            SafeArea(
-              bottom: false,
-              child: pageAddresses.isEmpty
-                  ? Stack(
-                      children: [
-                        RefreshIndicator(
-                          color: Colors.white,
-                          backgroundColor: Colors.black26,
-                          onRefresh: () =>
-                              _refreshWeather(triggerSource: '下拉刷新'),
-                          child: _EmptyWeatherView(statusText: _statusText),
-                        ),
-                        Positioned(
-                          left: 18,
-                          top: 10,
-                          child: IconButton(
-                            tooltip: '管理位置',
-                            iconSize: 30,
-                            color: Colors.white,
-                            icon: const Icon(Icons.add),
-                            onPressed: _openLocationManagementPage,
-                          ),
-                        ),
-                      ],
-                    )
-                  : PageView.builder(
-                      controller: _addressPageController,
-                      allowImplicitScrolling: true,
-                      physics: const PageScrollPhysics(
-                        parent: ClampingScrollPhysics(),
-                      ),
-                      itemCount: pageAddresses.length,
-                      onPageChanged: _handleAddressPageChanged,
-                      itemBuilder: (context, index) {
-                        final address = pageAddresses[index];
-                        final addressId = address.id;
-                        final pageWeatherData = addressId == null
-                            ? null
-                            : _weatherDataByAddressId[addressId];
-                        return _WeatherAddressPage(
-                          address: address,
-                          data: pageWeatherData,
-                          addresses: pageAddresses,
-                          selectedAddressIndex: index,
-                          currentLocatedAddressId: _currentLocatedAddressId,
-                          currentLocatedAddress: _currentLocatedAddress,
-                          statusText: index == safeSelectedIndex
-                              ? _statusText
-                              : '正在读取天气数据...',
-                          isLoading: _isLoading && index == safeSelectedIndex,
-                          onRefresh: () =>
-                              _refreshWeather(triggerSource: '下拉刷新'),
-                          onManageLocations: _openLocationManagementPage,
-                          onManualRefresh: () =>
-                              _refreshWeather(triggerSource: '手动刷新'),
-                          onMenuAction: _handleMenuAction,
-                        );
-                      },
-                    ),
+            child: Stack(
+              children: [
+                Positioned.fill(
+                  child: _WeatherSceneBackground(background: background),
+                ),
+                if (child != null) child,
+              ],
             ),
-          ],
-        ),
+          );
+        },
       ),
     );
   }
@@ -994,12 +1010,12 @@ class _LocationPageIndicator extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    if (count <= 0) {
-      return const SizedBox(height: 12);
+    if (count <= 1) {
+      return const SizedBox.shrink();
     }
 
     return SizedBox(
-      height: 14,
+      height: 10,
       child: Center(
         child: SingleChildScrollView(
           scrollDirection: Axis.horizontal,
@@ -1007,7 +1023,7 @@ class _LocationPageIndicator extends StatelessWidget {
             mainAxisSize: MainAxisSize.min,
             children: [
               for (var index = 0; index < count; index += 1) ...[
-                if (index > 0) const SizedBox(width: 12),
+                if (index > 0) const SizedBox(width: 8),
                 _LocationDot(isSelected: index == selectedIndex),
               ],
             ],
@@ -1027,14 +1043,14 @@ class _LocationDot extends StatelessWidget {
   Widget build(BuildContext context) {
     return AnimatedContainer(
       duration: const Duration(milliseconds: 180),
-      width: isSelected ? 9 : 7,
-      height: isSelected ? 9 : 7,
+      width: 6,
+      height: 6,
       decoration: BoxDecoration(
         shape: BoxShape.circle,
-        color: Colors.white.withValues(alpha: isSelected ? 0.95 : 0.55),
+        color: isSelected ? Colors.white : Colors.transparent,
         border: Border.all(
-          color: Colors.white.withValues(alpha: isSelected ? 0.0 : 0.35),
-          width: 1,
+          color: Colors.white.withValues(alpha: isSelected ? 1 : 0.85),
+          width: 1.1,
         ),
       ),
     );
