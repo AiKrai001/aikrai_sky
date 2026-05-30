@@ -15,7 +15,17 @@ class AddressDatabaseService {
   static final AddressDatabaseService instance = AddressDatabaseService._();
 
   static const _databaseName = 'aikrai_sky.db';
-  static const _databaseVersion = 4;
+  static const _databaseVersion = 5;
+
+  /// App 状态表以 key-value 形式保存跨启动状态。
+  ///
+  /// 当前只需要记录“上一次真正定位到的位置 id”，后续如果要保存上次选中页、
+  /// 刷新时间等，也可以继续复用这张表。
+  static const _appStateTableName = 'app_state';
+  static const _appStateColumnKey = 'key';
+  static const _appStateColumnValue = 'value';
+  static const _appStateColumnUpdatedAt = 'updated_at';
+  static const _lastLocatedAddressIdKey = 'last_located_address_id';
 
   Database? _database;
 
@@ -51,6 +61,7 @@ class AddressDatabaseService {
   Future<void> _createDatabase(Database db, int version) async {
     await _createAddressTable(db);
     await _createWeatherDataTable(db);
+    await _createAppStateTable(db);
   }
 
   /// 处理数据库升级。
@@ -69,6 +80,9 @@ class AddressDatabaseService {
     }
     if (oldVersion < 4) {
       await _addAddressSortOrderColumn(db);
+    }
+    if (oldVersion < 5) {
+      await _createAppStateTable(db);
     }
   }
 
@@ -136,6 +150,17 @@ class AddressDatabaseService {
       ON ${WeatherRecord.tableName} (
         ${WeatherRecord.columnAddressId},
         ${WeatherRecord.columnWeatherDate}
+      )
+    ''');
+  }
+
+  /// 创建 App 状态表。
+  Future<void> _createAppStateTable(Database db) async {
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS $_appStateTableName (
+        $_appStateColumnKey TEXT PRIMARY KEY,
+        $_appStateColumnValue TEXT NOT NULL,
+        $_appStateColumnUpdatedAt TEXT NOT NULL
       )
     ''');
   }
@@ -263,6 +288,73 @@ class AddressDatabaseService {
     return AddressRecord.fromMap(rows.first);
   }
 
+  /// 根据主键查询地址记录。
+  Future<AddressRecord?> fetchAddressById(int addressId) async {
+    final db = await database;
+    final rows = await db.query(
+      AddressRecord.tableName,
+      where: '${AddressRecord.columnId} = ?',
+      whereArgs: [addressId],
+      limit: 1,
+    );
+
+    if (rows.isEmpty) {
+      return null;
+    }
+    return AddressRecord.fromMap(rows.first);
+  }
+
+  /// 保存上一次成功定位到的地址 id。
+  Future<void> saveLastLocatedAddressId(int addressId) {
+    return _setAppStateValue(
+      key: _lastLocatedAddressIdKey,
+      value: addressId.toString(),
+    );
+  }
+
+  /// 读取上一次成功定位到的地址。
+  ///
+  /// 如果 app_state 中的 id 已经被删除，返回 null，让启动流程自然兜底到
+  /// 地址表中的其他记录或空状态。
+  Future<AddressRecord?> fetchLastLocatedAddress() async {
+    final value = await _fetchAppStateValue(_lastLocatedAddressIdKey);
+    final addressId = value == null ? null : int.tryParse(value);
+    if (addressId == null) {
+      return null;
+    }
+    return fetchAddressById(addressId);
+  }
+
+  /// 写入或更新一条 App 状态。
+  Future<void> _setAppStateValue({
+    required String key,
+    required String value,
+  }) async {
+    final db = await database;
+    await db.insert(_appStateTableName, {
+      _appStateColumnKey: key,
+      _appStateColumnValue: value,
+      _appStateColumnUpdatedAt: DateTime.now().toIso8601String(),
+    }, conflictAlgorithm: ConflictAlgorithm.replace);
+  }
+
+  /// 读取一条 App 状态值。
+  Future<String?> _fetchAppStateValue(String key) async {
+    final db = await database;
+    final rows = await db.query(
+      _appStateTableName,
+      columns: const [_appStateColumnValue],
+      where: '$_appStateColumnKey = ?',
+      whereArgs: [key],
+      limit: 1,
+    );
+
+    if (rows.isEmpty) {
+      return null;
+    }
+    return rows.first[_appStateColumnValue] as String?;
+  }
+
   /// 分页查询地址表记录。
   ///
   /// [date] 为空时查询全部地址；不为空时只查询该本地日期更新的地址记录。
@@ -347,6 +439,11 @@ class AddressDatabaseService {
         AddressRecord.tableName,
         where: '${AddressRecord.columnId} = ?',
         whereArgs: [addressId],
+      );
+      await txn.delete(
+        _appStateTableName,
+        where: '$_appStateColumnKey = ? AND $_appStateColumnValue = ?',
+        whereArgs: [_lastLocatedAddressIdKey, addressId.toString()],
       );
     });
   }

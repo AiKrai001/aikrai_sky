@@ -114,6 +114,67 @@ void main() {
     expect(record.latitude, 31.25095);
     expect(record.longitude, 121.49228);
   });
+
+  test('buildTencentGeocoderAddressRecord maps reverse geocoder response', () {
+    final record = service.buildTencentGeocoderAddressRecord({
+      'status': 0,
+      'result': {
+        'location': {'lat': 31.25095, 'lng': 121.49228},
+        'address': '上海市虹口区东大名路501号',
+        'address_component': {
+          'nation': '中国',
+          'province': '上海市',
+          'city': '上海市',
+          'district': '虹口区',
+          'street': '东大名路',
+          'street_number': '501号',
+        },
+      },
+    });
+
+    expect(record, isNotNull);
+    expect(record!.province, '上海市');
+    expect(record.city, '上海市');
+    expect(record.district, '虹口区');
+    expect(record.detailAddress, contains('东大名路501号'));
+    expect(record.latitude, 31.25095);
+    expect(record.longitude, 121.49228);
+  });
+
+  test('buildTencentNativeAddressRecord maps Android SDK location', () {
+    final record = service.buildTencentNativeAddressRecord({
+      'latitude': 31.2646,
+      'longitude': 121.5051,
+      'nation': '中国',
+      'province': '上海市',
+      'city': '上海市',
+      'district': '虹口区',
+      'street': '东大名路',
+      'streetNo': '501号',
+      'name': '上海白玉兰广场',
+      'address': '上海市虹口区东大名路501号',
+    });
+
+    expect(record.province, '上海市');
+    expect(record.city, '上海市');
+    expect(record.district, '虹口区');
+    expect(record.detailAddress, contains('东大名路501号'));
+    expect(record.latitude, 31.2646);
+    expect(record.longitude, 121.5051);
+  });
+
+  test(
+    'capture mapper rejects Tencent native location without area fields',
+    () {
+      expect(
+        () => service.buildTencentNativeAddressRecord({
+          'latitude': 31.2646,
+          'longitude': 121.5051,
+        }),
+        throwsA(isA<LocationAddressException>()),
+      );
+    },
+  );
 }
 
 Position _position({required double latitude, required double longitude}) {

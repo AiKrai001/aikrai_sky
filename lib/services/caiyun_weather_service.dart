@@ -1,5 +1,6 @@
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 
 import '../models/address_record.dart';
@@ -33,6 +34,11 @@ class CaiyunWeatherService {
     }
 
     final now = DateTime.now();
+    debugPrint(
+      '[AiKraiSky][WeatherApi] 请求彩云天气：'
+      'addressId=$addressId, lat=${address.latitude}, lng=${address.longitude}, '
+      'district=${address.district}',
+    );
     final rawResponse = await _fetchWeatherRawJson(address);
 
     return _database.upsertWeatherRecord(
@@ -84,6 +90,10 @@ class CaiyunWeatherService {
       final response = await client
           .get(uri)
           .timeout(const Duration(seconds: 15));
+      debugPrint(
+        '[AiKraiSky][WeatherApi] 彩云天气 HTTP 状态：'
+        '${response.statusCode}, lat=${address.latitude}, lng=${address.longitude}',
+      );
       if (response.statusCode != 200) {
         throw CaiyunWeatherException('彩云天气请求失败：HTTP ${response.statusCode}');
       }

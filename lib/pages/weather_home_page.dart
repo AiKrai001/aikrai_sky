@@ -14,7 +14,8 @@ import 'weather_records_page.dart';
 /// 天气首页。
 ///
 /// 页面从上到下展示：当前天气、近 24 小时、近 7 天、空气质量、生活指数。
-/// 启动、下拉刷新、点击刷新时会重新获取定位与天气数据。
+/// 启动时会先展示上一次定位城市的本地天气，再尝试重新定位；普通刷新只更新天气，
+/// 不重新定位，也不会把非定位城市页面切回定位城市。
 class WeatherHomePage extends StatefulWidget {
   const WeatherHomePage({super.key});
 
@@ -43,14 +44,14 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
   int? _currentLocatedAddressId;
   AddressRecord? _currentLocatedAddress;
   int _addressSwitchRequestId = 0;
-  String _statusText = '正在获取定位和天气数据...';
-  bool _isLoading = false;
+  String _statusText = '正在读取本地天气...';
+  bool _isLocating = false;
+  bool _isRefreshingWeather = false;
 
   @override
   void initState() {
     super.initState();
-    _loadSavedWeather();
-    _refreshWeather(triggerSource: '应用启动');
+    _initializeHome();
   }
 
   @override
@@ -60,11 +61,40 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
     super.dispose();
   }
 
-  /// 先展示本地已保存的最新天气，避免启动时页面长时间空白。
-  Future<void> _loadSavedWeather() async {
+  int? get _selectedAddressId {
+    if (_addresses.isNotEmpty &&
+        _selectedAddressIndex >= 0 &&
+        _selectedAddressIndex < _addresses.length) {
+      return _addresses[_selectedAddressIndex].id;
+    }
+    return _weatherData?.address.id;
+  }
+
+  /// 启动首页。
+  ///
+  /// 先展示 app_state 中记录的上一次定位城市本地天气，随后后台重新定位。
+  /// 只有启动定位成功且地区变化时，才自动切换到新的定位城市。
+  Future<void> _initializeHome() async {
+    _logWeatherHome('启动首页，开始读取本地缓存和定位状态');
+    await _loadStartupWeatherCache();
+    await _refreshLocationThenAllWeather(
+      triggerSource: '应用启动',
+      allowSwitchWhenDistrictChanged: true,
+    );
+  }
+
+  /// 先展示上一次定位城市的本地天气，避免启动时页面长时间空白。
+  Future<void> _loadStartupWeatherCache() async {
     try {
       final addresses = await AddressDatabaseService.instance
           .fetchAllAddressRecords();
+      final lastLocatedAddress = await AddressDatabaseService.instance
+          .fetchLastLocatedAddress();
+      _logWeatherHome(
+        '本地启动缓存：addressCount=${addresses.length}, '
+        'lastLocatedId=${lastLocatedAddress?.id}, '
+        'lastLocatedDistrict=${lastLocatedAddress?.district}',
+      );
       if (addresses.isEmpty) {
         return;
       }
@@ -76,8 +106,15 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
         if (mounted) {
           setState(() {
             _addresses = addresses;
-            _selectedAddressIndex = 0;
+            _selectedAddressIndex = _indexOfAddress(
+              lastLocatedAddress?.id ?? addresses.first.id,
+              addresses,
+            );
+            _currentLocatedAddressId = lastLocatedAddress?.id;
+            _currentLocatedAddress = lastLocatedAddress;
+            _statusText = '暂无本地天气，正在刷新...';
           });
+          _scheduleAddressPageSync();
         }
         return;
       }
@@ -86,9 +123,9 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
         return;
       }
 
-      final latestAddressId = addresses.first.id;
+      final startupAddressId = lastLocatedAddress?.id ?? addresses.first.id;
       final displayData =
-          savedWeatherByAddressId[latestAddressId] ??
+          savedWeatherByAddressId[startupAddressId] ??
           savedWeatherByAddressId.values.first;
 
       setState(() {
@@ -101,97 +138,113 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
         _weatherDataByAddressId
           ..clear()
           ..addAll(savedWeatherByAddressId);
+        _currentLocatedAddressId = lastLocatedAddress?.id;
+        _currentLocatedAddress = lastLocatedAddress;
         _statusText = '已读取本地天气，正在刷新...';
       });
       _backgroundStyle.value = displayData.background;
       _scheduleAddressPageSync();
     } catch (error) {
-      _showStatus('读取本地天气失败，正在尝试重新定位：$error');
+      _showStatus('读取本地天气失败，正在继续刷新：$error');
     }
   }
 
-  /// 刷新定位、天气和页面展示数据。
-  Future<void> _refreshWeather({required String triggerSource}) async {
-    if (_isLoading) {
-      return;
+  /// 重新定位当前位置。
+  ///
+  /// 这个方法只负责定位和地址落库，不请求天气，也不主动切换当前页面。
+  Future<AddressRecord?> _refreshCurrentLocation({
+    required String triggerSource,
+  }) async {
+    if (_isLocating) {
+      return null;
     }
 
+    final selectedAddressId = _selectedAddressId;
     setState(() {
-      _addressSwitchRequestId += 1;
-      _isLoading = true;
+      _isLocating = true;
       _statusText = '$triggerSource：正在获取当前位置...';
     });
 
     try {
       final address = await _locationAddressService
           .captureAndSaveCurrentAddress();
-      if (!mounted) {
-        return;
+      final addressId = address.id;
+      _logWeatherHome(
+        '$triggerSource：定位成功 id=$addressId, '
+        'province=${address.province}, city=${address.city}, '
+        'district=${address.district}, detail=${address.detailAddress}',
+      );
+      if (addressId != null) {
+        await AddressDatabaseService.instance.saveLastLocatedAddressId(
+          addressId,
+        );
       }
 
-      final addressId = address.id;
       final addresses = await AddressDatabaseService.instance
           .fetchAllAddressRecords();
       if (!mounted) {
-        return;
+        return address;
       }
 
       setState(() {
         _addresses = addresses.isEmpty ? [address] : addresses;
-        _selectedAddressIndex = _indexOfAddress(addressId, _addresses);
+        _selectedAddressIndex = _indexOfAddress(
+          selectedAddressId ?? _selectedAddressId,
+          _addresses,
+        );
         _currentLocatedAddressId = addressId;
         _currentLocatedAddress = address;
-        _statusText = '$triggerSource：正在请求天气数据...';
+        _statusText = '$triggerSource：定位已更新';
       });
       _scheduleAddressPageSync();
-
-      final currentWeather = await _caiyunWeatherService.fetchAndSaveWeather(
-        address,
-      );
-      final yesterdayWeather = addressId == null
-          ? null
-          : await AddressDatabaseService.instance
-                .fetchWeatherByAddressIdAndDate(
-                  addressId: addressId,
-                  date: DateTime.now().subtract(const Duration(days: 1)),
-                );
-
-      if (!mounted) {
-        return;
-      }
-
-      final displayData = WeatherDisplayData.fromRecords(
-        address: address,
-        currentRecord: currentWeather,
-        yesterdayRecord: yesterdayWeather,
-      );
-      _backgroundStyle.value = displayData.background;
-
-      setState(() {
-        _addresses = addresses.isEmpty ? [address] : addresses;
-        _selectedAddressIndex = _indexOfAddress(addressId, _addresses);
-        _currentLocatedAddressId = addressId;
-        _currentLocatedAddress = address;
-        _weatherData = displayData;
-        if (addressId != null) {
-          _weatherDataByAddressId[addressId] = displayData;
-        }
-        _statusText = '$triggerSource：天气已更新';
-      });
-      _scheduleAddressPageSync();
+      return address;
     } on LocationAddressException catch (error) {
-      _showStatus('$triggerSource：${error.message}');
-    } on CaiyunWeatherException catch (error) {
-      _showStatus('$triggerSource：天气获取失败：${error.message}');
+      _showStatus('$triggerSource：${error.message}，将继续刷新天气。');
+      return null;
     } catch (error) {
-      _showStatus('$triggerSource：刷新失败，$error');
+      _showStatus('$triggerSource：定位失败，$error，将继续刷新天气。');
+      return null;
     } finally {
       if (mounted) {
         setState(() {
-          _isLoading = false;
+          _isLocating = false;
         });
       }
     }
+  }
+
+  /// 先尝试定位，再刷新所有位置天气。
+  ///
+  /// 定位失败不会中断天气刷新。只有启动场景允许在地区变化后自动切到新定位城市。
+  Future<void> _refreshLocationThenAllWeather({
+    required String triggerSource,
+    required bool allowSwitchWhenDistrictChanged,
+  }) async {
+    final oldLocatedAddress =
+        _currentLocatedAddress ??
+        await AddressDatabaseService.instance.fetchLastLocatedAddress();
+    _logWeatherHome(
+      '$triggerSource：开始定位后刷新，oldDistrict=${oldLocatedAddress?.district}, '
+      'allowSwitch=$allowSwitchWhenDistrictChanged',
+    );
+    final newLocatedAddress = await _refreshCurrentLocation(
+      triggerSource: triggerSource,
+    );
+
+    final shouldSwitch =
+        mounted &&
+        allowSwitchWhenDistrictChanged &&
+        newLocatedAddress?.id != null &&
+        !_isSameDistrict(oldLocatedAddress, newLocatedAddress!);
+    _logWeatherHome(
+      '$triggerSource：定位后刷新，newDistrict=${newLocatedAddress?.district}, '
+      'shouldSwitch=$shouldSwitch',
+    );
+    if (shouldSwitch) {
+      _selectAddressById(newLocatedAddress.id);
+    }
+
+    await _refreshAllWeather(triggerSource: triggerSource);
   }
 
   /// 处理顶部位置横向滑动。
@@ -264,9 +317,168 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
     }
   }
 
+  /// 刷新所有已保存位置的天气。
+  ///
+  /// 当前页面城市优先请求并立即更新 UI；其他城市随后并发刷新。整个流程不定位、
+  /// 不修改 app_state，也不强制切换 PageView。
+  Future<void> _refreshAllWeather({required String triggerSource}) async {
+    if (_isRefreshingWeather) {
+      return;
+    }
+
+    final selectedAddressId = _selectedAddressId;
+    final addresses = await AddressDatabaseService.instance
+        .fetchAllAddressRecords();
+    if (!mounted) {
+      return;
+    }
+    if (addresses.isEmpty) {
+      setState(() {
+        _addresses = const [];
+        _weatherData = null;
+        _weatherDataByAddressId.clear();
+        _statusText = '$triggerSource：暂无位置，请先添加位置。';
+      });
+      return;
+    }
+
+    final selectedIndex = _indexOfAddress(
+      selectedAddressId ?? _currentLocatedAddressId ?? addresses.first.id,
+      addresses,
+    );
+    final selectedAddress = addresses[selectedIndex];
+    _logWeatherHome(
+      '$triggerSource：开始刷新所有位置天气，addressCount=${addresses.length}, '
+      'selectedId=${selectedAddress.id}, selected=${_locationTitle(selectedAddress)}',
+    );
+    setState(() {
+      _addresses = addresses;
+      _selectedAddressIndex = selectedIndex;
+      _isRefreshingWeather = true;
+      _statusText = '$triggerSource：正在更新天气...';
+    });
+    _scheduleAddressPageSync();
+
+    final failures = <String>[];
+    try {
+      final selectedResult = await _refreshWeatherForAddress(selectedAddress);
+      if (mounted && selectedResult.data != null) {
+        final displayData = selectedResult.data!;
+        _logWeatherHome(
+          '$triggerSource：当前城市天气刷新成功，'
+          'addressId=${displayData.address.id}, '
+          'title=${_locationTitle(displayData.address)}',
+        );
+        _backgroundStyle.value = displayData.background;
+        setState(() {
+          _weatherData = displayData;
+          if (displayData.address.id != null) {
+            _weatherDataByAddressId[displayData.address.id!] = displayData;
+          }
+          _statusText = '$triggerSource：当前城市天气已更新';
+        });
+      } else if (selectedResult.error != null) {
+        _logWeatherHome(
+          '$triggerSource：当前城市天气刷新失败，'
+          'addressId=${selectedAddress.id}, error=${selectedResult.error}',
+        );
+        failures.add(_locationTitle(selectedAddress));
+      }
+
+      final otherAddresses = addresses
+          .where((address) => address.id != selectedAddress.id)
+          .toList();
+      final otherResults = await _refreshWeatherForAddresses(otherAddresses);
+      if (!mounted) {
+        return;
+      }
+
+      final updatedWeather = <int, WeatherDisplayData>{};
+      for (final result in otherResults) {
+        final addressId = result.address.id;
+        if (result.data != null && addressId != null) {
+          _logWeatherHome(
+            '$triggerSource：后台城市天气刷新成功，'
+            'addressId=$addressId, title=${_locationTitle(result.address)}',
+          );
+          updatedWeather[addressId] = result.data!;
+        } else if (result.error != null) {
+          _logWeatherHome(
+            '$triggerSource：后台城市天气刷新失败，'
+            'addressId=$addressId, title=${_locationTitle(result.address)}, '
+            'error=${result.error}',
+          );
+          failures.add(_locationTitle(result.address));
+        }
+      }
+
+      setState(() {
+        _weatherDataByAddressId.addAll(updatedWeather);
+        if (failures.isEmpty) {
+          _statusText = '$triggerSource：所有位置天气已更新';
+        } else if (failures.length == addresses.length) {
+          _statusText = '$triggerSource：天气更新失败，请检查网络。';
+        } else {
+          _statusText = '$triggerSource：部分位置更新失败：${failures.join('、')}';
+        }
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isRefreshingWeather = false;
+        });
+      }
+    }
+  }
+
+  Future<_AddressWeatherRefreshResult> _refreshWeatherForAddress(
+    AddressRecord address,
+  ) async {
+    try {
+      final data = await _fetchWeatherDisplayData(address, forceNetwork: true);
+      return _AddressWeatherRefreshResult(address: address, data: data);
+    } catch (error) {
+      return _AddressWeatherRefreshResult(address: address, error: error);
+    }
+  }
+
+  Future<List<_AddressWeatherRefreshResult>> _refreshWeatherForAddresses(
+    List<AddressRecord> addresses,
+  ) async {
+    if (addresses.isEmpty) {
+      return const [];
+    }
+
+    const maxConcurrency = 3;
+    final results = <_AddressWeatherRefreshResult>[];
+    var nextIndex = 0;
+
+    Future<void> worker() async {
+      while (nextIndex < addresses.length) {
+        final currentIndex = nextIndex;
+        nextIndex += 1;
+        final result = await _refreshWeatherForAddress(addresses[currentIndex]);
+        results.add(result);
+      }
+    }
+
+    final workerCount = math.min(maxConcurrency, addresses.length);
+    await Future.wait([
+      for (var index = 0; index < workerCount; index += 1) worker(),
+    ]);
+    return results;
+  }
+
   Future<WeatherDisplayData> _loadWeatherForAddress(
     AddressRecord address,
   ) async {
+    return _fetchWeatherDisplayData(address, forceNetwork: false);
+  }
+
+  Future<WeatherDisplayData> _fetchWeatherDisplayData(
+    AddressRecord address, {
+    required bool forceNetwork,
+  }) async {
     final addressId = address.id;
     if (addressId == null) {
       throw const CaiyunWeatherException('地址记录缺少 id，无法关联保存天气数据。');
@@ -274,9 +486,10 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
 
     final savedWeather = await AddressDatabaseService.instance
         .fetchLatestWeatherByAddressId(addressId);
-    final currentWeather =
-        savedWeather ??
-        await _caiyunWeatherService.fetchAndSaveWeather(address);
+    final currentWeather = forceNetwork
+        ? await _caiyunWeatherService.fetchAndSaveWeather(address)
+        : savedWeather ??
+              await _caiyunWeatherService.fetchAndSaveWeather(address);
     final yesterdayWeather = await AddressDatabaseService.instance
         .fetchWeatherByAddressIdAndDate(
           addressId: addressId,
@@ -288,6 +501,34 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
       currentRecord: currentWeather,
       yesterdayRecord: yesterdayWeather,
     );
+  }
+
+  void _selectAddressById(int? addressId) {
+    if (addressId == null || _addresses.isEmpty) {
+      return;
+    }
+
+    final index = _indexOfAddress(addressId, _addresses);
+    final displayData = _weatherDataByAddressId[addressId];
+    setState(() {
+      _selectedAddressIndex = index;
+      if (displayData != null) {
+        _weatherData = displayData;
+      }
+    });
+    if (displayData != null) {
+      _backgroundStyle.value = displayData.background;
+    }
+    _scheduleAddressPageSync();
+  }
+
+  bool _isSameDistrict(AddressRecord? oldAddress, AddressRecord newAddress) {
+    final oldDistrict = oldAddress?.district.trim();
+    final newDistrict = newAddress.district.trim();
+    if (oldDistrict == null || oldDistrict.isEmpty || newDistrict.isEmpty) {
+      return false;
+    }
+    return oldDistrict == newDistrict;
   }
 
   /// 预读地址表中已有的本地天气缓存。
@@ -334,8 +575,7 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
       return;
     }
 
-    final selectedAddressId =
-        _currentLocatedAddressId ?? _weatherData?.address.id;
+    final selectedAddressId = _selectedAddressId ?? _weatherData?.address.id;
     final selectedIndex = _indexOfAddress(selectedAddressId, addresses);
     final selectedAddress = addresses.isEmpty ? null : addresses[selectedIndex];
     final selectedWeatherData = selectedAddress?.id == null
@@ -386,9 +626,14 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
     if (!mounted) {
       return;
     }
+    _logWeatherHome('状态更新：$message');
     setState(() {
       _statusText = message;
     });
+  }
+
+  void _logWeatherHome(String message) {
+    debugPrint('[AiKraiSky][WeatherHome] $message');
   }
 
   @override
@@ -408,7 +653,10 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
                 RefreshIndicator(
                   color: Colors.white,
                   backgroundColor: Colors.black26,
-                  onRefresh: () => _refreshWeather(triggerSource: '下拉刷新'),
+                  onRefresh: () => _refreshLocationThenAllWeather(
+                    triggerSource: '下拉重新定位',
+                    allowSwitchWhenDistrictChanged: true,
+                  ),
                   child: _EmptyWeatherView(statusText: _statusText),
                 ),
                 Positioned(
@@ -446,11 +694,12 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
                   statusText: index == safeSelectedIndex
                       ? _statusText
                       : '正在读取天气数据...',
-                  isLoading: _isLoading && index == safeSelectedIndex,
-                  onRefresh: () => _refreshWeather(triggerSource: '下拉刷新'),
+                  isLoading:
+                      (_isLocating || _isRefreshingWeather) &&
+                      index == safeSelectedIndex,
+                  onRefresh: () => _refreshAllWeather(triggerSource: '下拉刷新'),
+                  onLargeRefresh: () => _handleLargePullRefresh(address),
                   onManageLocations: _openLocationManagementPage,
-                  onManualRefresh: () =>
-                      _refreshWeather(triggerSource: '手动刷新'),
                   onMenuAction: _handleMenuAction,
                 );
               },
@@ -480,7 +729,7 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
                 Positioned.fill(
                   child: _WeatherSceneBackground(background: background),
                 ),
-                if (child != null) child,
+                ?child,
               ],
             ),
           );
@@ -492,7 +741,7 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
   void _handleMenuAction(_WeatherMenuAction action) {
     switch (action) {
       case _WeatherMenuAction.refresh:
-        _refreshWeather(triggerSource: '手动刷新');
+        _refreshAllWeather(triggerSource: '手动刷新');
       case _WeatherMenuAction.addressTable:
         Navigator.of(context).push(
           MaterialPageRoute<void>(builder: (_) => const AddressRecordsPage()),
@@ -502,6 +751,24 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
           MaterialPageRoute<void>(builder: (_) => const WeatherRecordsPage()),
         );
     }
+  }
+
+  Future<void> _handleLargePullRefresh(AddressRecord address) {
+    _logWeatherHome(
+      '大幅下拉触发：addressId=${address.id}, title=${_locationTitle(address)}, '
+      'currentLocatedId=$_currentLocatedAddressId',
+    );
+    if (_isCurrentLocatedAddress(
+      address: address,
+      currentLocatedAddressId: _currentLocatedAddressId,
+      currentLocatedAddress: _currentLocatedAddress,
+    )) {
+      return _refreshLocationThenAllWeather(
+        triggerSource: '下拉重新定位',
+        allowSwitchWhenDistrictChanged: false,
+      );
+    }
+    return _refreshAllWeather(triggerSource: '下拉刷新');
   }
 
   Future<void> _openLocationManagementPage() async {
@@ -521,6 +788,18 @@ class _WeatherHomePageState extends State<WeatherHomePage> {
 
 enum _WeatherMenuAction { refresh, addressTable, weatherTable }
 
+class _AddressWeatherRefreshResult {
+  const _AddressWeatherRefreshResult({
+    required this.address,
+    this.data,
+    this.error,
+  });
+
+  final AddressRecord address;
+  final WeatherDisplayData? data;
+  final Object? error;
+}
+
 class _WeatherAddressPage extends StatefulWidget {
   const _WeatherAddressPage({
     required this.address,
@@ -532,8 +811,8 @@ class _WeatherAddressPage extends StatefulWidget {
     required this.statusText,
     required this.isLoading,
     required this.onRefresh,
+    required this.onLargeRefresh,
     required this.onManageLocations,
-    required this.onManualRefresh,
     required this.onMenuAction,
   });
 
@@ -546,8 +825,8 @@ class _WeatherAddressPage extends StatefulWidget {
   final String statusText;
   final bool isLoading;
   final Future<void> Function() onRefresh;
+  final Future<void> Function() onLargeRefresh;
   final VoidCallback onManageLocations;
-  final VoidCallback onManualRefresh;
   final ValueChanged<_WeatherMenuAction> onMenuAction;
 
   @override
@@ -564,10 +843,9 @@ class _WeatherAddressPageState extends State<_WeatherAddressPage>
     super.build(context);
     final weatherData = widget.data;
     return RepaintBoundary(
-      child: RefreshIndicator(
-        color: Colors.white,
-        backgroundColor: Colors.black26,
+      child: _TwoStageRefreshIndicator(
         onRefresh: widget.onRefresh,
+        onLargeRefresh: widget.onLargeRefresh,
         child: weatherData == null
             ? ListView(
                 key: PageStorageKey('weather-placeholder-${widget.address.id}'),
@@ -615,6 +893,398 @@ class _WeatherAddressPageState extends State<_WeatherAddressPage>
                   _LifeIndexModule(items: weatherData.lifeIndices),
                 ],
               ),
+      ),
+    );
+  }
+}
+
+/// 两段式下拉刷新。
+///
+/// 下拉超过屏幕高度 15% 后释放刷新天气；超过 28% 后释放进入大幅刷新，
+/// 是否重新定位交给页面按“当前页是否定位城市”判断。
+class _TwoStageRefreshIndicator extends StatefulWidget {
+  const _TwoStageRefreshIndicator({
+    required this.child,
+    required this.onRefresh,
+    required this.onLargeRefresh,
+  });
+
+  static const _smallRefreshRatio = 0.15;
+  static const _largeRefreshRatio = 0.28;
+
+  final Widget child;
+  final Future<void> Function() onRefresh;
+  final Future<void> Function() onLargeRefresh;
+
+  @override
+  State<_TwoStageRefreshIndicator> createState() =>
+      _TwoStageRefreshIndicatorState();
+}
+
+class _TwoStageRefreshIndicatorState extends State<_TwoStageRefreshIndicator> {
+  double _currentPullExtent = 0;
+  double? _pointerStartY;
+  bool _isAtTop = true;
+  bool _isPointerDown = false;
+  bool _isHandlingRefresh = false;
+  String _refreshingText = '正在刷新天气';
+
+  bool _handleScrollNotification(ScrollNotification notification) {
+    if (notification.depth != 0 || notification.metrics.axis != Axis.vertical) {
+      return false;
+    }
+
+    if (notification is ScrollStartNotification) {
+      _isAtTop = notification.metrics.extentBefore == 0;
+    } else if (notification is ScrollUpdateNotification &&
+        notification.metrics.extentBefore == 0) {
+      _isAtTop = true;
+    } else if (notification is OverscrollNotification &&
+        notification.metrics.extentBefore == 0) {
+      _isAtTop = true;
+    } else if (notification is ScrollEndNotification) {
+      _isAtTop = notification.metrics.extentBefore == 0;
+    }
+
+    return false;
+  }
+
+  double _smallRefreshOffset(BuildContext context) {
+    return MediaQuery.sizeOf(context).height *
+        _TwoStageRefreshIndicator._smallRefreshRatio;
+  }
+
+  double _largeRefreshOffset(BuildContext context) {
+    return MediaQuery.sizeOf(context).height *
+        _TwoStageRefreshIndicator._largeRefreshRatio;
+  }
+
+  void _resetPullState({bool keepPointer = false}) {
+    _currentPullExtent = 0;
+    _pointerStartY = null;
+    if (!keepPointer) {
+      _isPointerDown = false;
+    }
+  }
+
+  Future<void> _handleRelease(double releasePullExtent) async {
+    if (_isHandlingRefresh) {
+      return;
+    }
+
+    final smallOffset = _smallRefreshOffset(context);
+    final largeOffset = _largeRefreshOffset(context);
+    final isLargeRefresh = releasePullExtent >= largeOffset;
+    final isSmallRefresh = releasePullExtent >= smallOffset;
+    debugPrint(
+      '[AiKraiSky][Refresh] 释放下拉刷新：'
+      'releasePull=${releasePullExtent.toStringAsFixed(1)}, '
+      'small=${smallOffset.toStringAsFixed(1)}, '
+      'large=${largeOffset.toStringAsFixed(1)}, '
+      'stage=${isLargeRefresh
+          ? 'large'
+          : isSmallRefresh
+          ? 'small'
+          : 'none'}',
+    );
+
+    if (!isLargeRefresh && !isSmallRefresh) {
+      return;
+    }
+
+    if (mounted) {
+      setState(() {
+        _isHandlingRefresh = true;
+        _refreshingText = isLargeRefresh ? '正在重新定位并刷新' : '正在刷新天气';
+      });
+    } else {
+      _isHandlingRefresh = true;
+      _refreshingText = isLargeRefresh ? '正在重新定位并刷新' : '正在刷新天气';
+    }
+    try {
+      if (isLargeRefresh) {
+        await widget.onLargeRefresh();
+      } else {
+        await widget.onRefresh();
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isHandlingRefresh = false;
+        });
+      } else {
+        _isHandlingRefresh = false;
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final smallOffset = _smallRefreshOffset(context);
+    final largeOffset = _largeRefreshOffset(context);
+    final showGuide =
+        _isPointerDown &&
+        _isAtTop &&
+        _currentPullExtent > 8 &&
+        !_isHandlingRefresh;
+    final actionText = _currentPullExtent >= largeOffset
+        ? '释放后重新定位并刷新'
+        : _currentPullExtent >= smallOffset
+        ? '释放后刷新天气'
+        : '继续下拉刷新天气';
+
+    return Listener(
+      onPointerDown: (event) {
+        setState(() {
+          _resetPullState(keepPointer: true);
+          _isPointerDown = true;
+          _pointerStartY = _isAtTop ? event.position.dy : null;
+        });
+      },
+      onPointerMove: (event) {
+        if (_isAtTop) {
+          final pointerStartY = _pointerStartY ?? event.position.dy;
+          _pointerStartY = pointerStartY;
+          final pullExtent = math.max(0.0, event.position.dy - pointerStartY);
+          setState(() {
+            _currentPullExtent = pullExtent;
+          });
+        }
+      },
+      onPointerUp: (_) {
+        final releasePullExtent = _currentPullExtent;
+        debugPrint(
+          '[AiKraiSky][Refresh] 手势结束：'
+          'releasePull=${releasePullExtent.toStringAsFixed(1)}, '
+          'small=${smallOffset.toStringAsFixed(1)}, '
+          'large=${largeOffset.toStringAsFixed(1)}',
+        );
+        setState(() {
+          _resetPullState();
+        });
+        _handleRelease(releasePullExtent);
+      },
+      onPointerCancel: (_) {
+        setState(_resetPullState);
+      },
+      child: Stack(
+        children: [
+          NotificationListener<ScrollNotification>(
+            onNotification: _handleScrollNotification,
+            child: widget.child,
+          ),
+          IgnorePointer(
+            child: AnimatedOpacity(
+              duration: const Duration(milliseconds: 120),
+              opacity: showGuide ? 1 : 0,
+              child: _PullGuideOverlay(
+                smallOffset: smallOffset,
+                largeOffset: largeOffset,
+                actionText: actionText,
+                pullExtent: _currentPullExtent,
+              ),
+            ),
+          ),
+          IgnorePointer(
+            child: AnimatedOpacity(
+              duration: const Duration(milliseconds: 120),
+              opacity: _isHandlingRefresh ? 1 : 0,
+              child: _PullRefreshingOverlay(text: _refreshingText),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _PullRefreshingOverlay extends StatelessWidget {
+  const _PullRefreshingOverlay({required this.text});
+
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox.expand(
+      child: Stack(
+        children: [
+          Positioned(
+            top: 18,
+            left: 0,
+            right: 0,
+            child: Center(
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  color: Colors.black.withValues(alpha: 0.24),
+                  borderRadius: BorderRadius.circular(18),
+                  border: Border.all(
+                    color: Colors.white.withValues(alpha: 0.20),
+                  ),
+                ),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 7,
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      SizedBox(
+                        width: 14,
+                        height: 14,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          valueColor: AlwaysStoppedAnimation<Color>(
+                            Colors.white.withValues(alpha: 0.92),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Text(
+                        text,
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 12,
+                          fontWeight: FontWeight.w500,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _PullGuideOverlay extends StatelessWidget {
+  const _PullGuideOverlay({
+    required this.smallOffset,
+    required this.largeOffset,
+    required this.actionText,
+    required this.pullExtent,
+  });
+
+  final double smallOffset;
+  final double largeOffset;
+  final String actionText;
+  final double pullExtent;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox.expand(
+      child: Stack(
+        children: [
+          // 暂时只显示文字提示，线条保留代码便于后续需要时恢复。
+          // _PullGuideLine(
+          //   top: smallOffset,
+          //   text: '12% 释放刷新天气',
+          //   isActive: pullExtent >= smallOffset,
+          // ),
+          // _PullGuideLine(
+          //   top: largeOffset,
+          //   text: '20% 释放重新定位',
+          //   isActive: pullExtent >= largeOffset,
+          // ),
+          Positioned(
+            top: math.max(
+              18,
+              math.min(
+                pullExtent - 36,
+                math.max(smallOffset, largeOffset) + 26,
+              ),
+            ),
+            left: 0,
+            right: 0,
+            child: Center(
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  color: Colors.black.withValues(alpha: 0.22),
+                  borderRadius: BorderRadius.circular(18),
+                  border: Border.all(
+                    color: Colors.white.withValues(alpha: 0.20),
+                  ),
+                ),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 6,
+                  ),
+                  child: Text(
+                    actionText,
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ignore: unused_element
+class _PullGuideLine extends StatelessWidget {
+  const _PullGuideLine({
+    required this.top,
+    required this.text,
+    required this.isActive,
+  });
+
+  final double top;
+  final String text;
+  final bool isActive;
+
+  @override
+  Widget build(BuildContext context) {
+    final color = Colors.white.withValues(alpha: isActive ? 0.72 : 0.28);
+    return Positioned(
+      top: top,
+      left: 18,
+      right: 18,
+      child: Row(
+        children: [
+          Expanded(
+            child: Container(
+              height: 1,
+              decoration: BoxDecoration(
+                color: color,
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withValues(alpha: 0.12),
+                    blurRadius: 8,
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(width: 8),
+          DecoratedBox(
+            decoration: BoxDecoration(
+              color: Colors.black.withValues(alpha: isActive ? 0.22 : 0.12),
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+              child: Text(
+                text,
+                style: TextStyle(
+                  color: color,
+                  fontSize: 11,
+                  fontWeight: isActive ? FontWeight.w600 : FontWeight.w400,
+                ),
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }

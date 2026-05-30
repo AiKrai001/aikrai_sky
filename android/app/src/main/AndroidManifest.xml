@@ -5,6 +5,12 @@
     <!-- 获取经纬度需要定位权限：粗略定位用于城市级兜底，精确定位用于提高省市区解析准确度。 -->
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
+    <!-- 腾讯网络定位会使用 Wi-Fi、网络状态和 A-GPS 辅助信息提升定位成功率。 -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE"/>
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE"/>
+    <uses-permission android:name="android.permission.ACCESS_LOCATION_EXTRA_COMMANDS"/>
 
     <application
         android:label="AiKraiSky"

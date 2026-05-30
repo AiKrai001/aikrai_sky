@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:geocoding/geocoding.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
@@ -25,6 +27,12 @@ class LocationAddressService {
   /// 手动搜索位置时的地理编码超时时间。
   static const _addressSearchTimeout = Duration(seconds: 10);
 
+  /// Google 连通性只用于选择定位方案，必须短超时，避免国内网络拖慢启动。
+  static const _googleReachabilityTimeout = Duration(milliseconds: 1800);
+
+  /// 使用 generate_204 可以减少响应体下载；主机仍是用户要求检测的 www.google.com。
+  static final _googleProbeUri = Uri.https('www.google.com', '/generate_204');
+
   /// 腾讯位置服务 WebService Key。
   ///
   /// 运行或打包时通过：
@@ -47,6 +55,11 @@ class LocationAddressService {
   /// 腾讯接口请求超时时间，避免搜索框一直转圈。
   static const _tencentSearchTimeout = Duration(seconds: 10);
 
+  /// Android 原生侧腾讯定位 SDK 桥接通道。
+  static const _tencentLocationChannel = MethodChannel(
+    'aikrai_sky/tencent_location',
+  );
+
   /// 允许测试或未来依赖注入时替换数据库服务；生产环境默认使用单例。
   final AddressDatabaseService? databaseService;
 
@@ -58,8 +71,31 @@ class LocationAddressService {
 
   /// 获取当前位置，转换为省市区详细地址，并写入地址表。
   Future<AddressRecord> captureAndSaveCurrentAddress() async {
+    _logLocation('开始获取当前位置');
     await _ensureLocationPermission();
 
+    final shouldUseGoogle = await _isGoogleReachable();
+    _logLocation('Google 连通性检测结果：$shouldUseGoogle');
+    if (shouldUseGoogle) {
+      try {
+        return await _captureByGoogleLocation();
+      } on LocationAddressException catch (error) {
+        _logLocation('Google 定位链路失败，降级腾讯定位：${error.message}');
+        // Google 服务可访问也不代表系统反地理编码一定成功；失败后立即降级腾讯定位。
+      } on PlatformException catch (error) {
+        _logLocation(
+          'Google 反地理编码平台异常，降级腾讯定位：'
+          '${error.code}, ${error.message}',
+        );
+        // geocoding 在部分设备上会抛 PlatformException(IO_ERROR, reverse geo fail)。
+      }
+    }
+
+    return _captureByTencentLocation();
+  }
+
+  /// 使用 geolocator + geocoding 获取当前位置。
+  Future<AddressRecord> _captureByGoogleLocation() async {
     final position = await _withTimeout(
       Geolocator.getCurrentPosition(
         locationSettings: const LocationSettings(
@@ -73,9 +109,124 @@ class LocationAddressService {
       message: '定位超时，请确认 GPS、网络定位和定位权限是否正常。',
     );
 
+    _logLocation(
+      'Google 原始定位：'
+      'lat=${position.latitude}, lng=${position.longitude}, '
+      'accuracy=${position.accuracy}',
+    );
     final placemark = await _reverseGeocode(position);
+    _logLocation('Google 原始反地理编码：$placemark');
     final address = buildAddressRecord(position, placemark);
+    _ensureAddressCanBeSaved(address, source: 'Google 定位');
+    _logLocation('Google 地址映射结果：${_addressSummary(address)}');
     return _database.upsertAddressByDistrict(address);
+  }
+
+  /// 使用腾讯 Android 定位 SDK 获取当前位置。
+  Future<AddressRecord> _captureByTencentLocation() async {
+    if (defaultTargetPlatform != TargetPlatform.android) {
+      throw const LocationAddressException('当前平台暂不支持腾讯定位兜底。');
+    }
+
+    final tencentKey = _tencentMapKey.trim();
+    if (tencentKey.isEmpty) {
+      throw const LocationAddressException('腾讯位置服务 Key 未配置，无法使用腾讯定位兜底。');
+    }
+
+    final rawResult = await _withTimeout<Object?>(
+      _tencentLocationChannel.invokeMethod<Object?>('requestCurrentLocation', {
+        'key': tencentKey,
+      }),
+      timeout: _locationTimeout,
+      message: '腾讯定位超时，请确认 GPS、网络定位和定位权限是否正常。',
+    );
+    if (rawResult is! Map) {
+      throw const LocationAddressException('腾讯定位返回数据格式异常。');
+    }
+
+    final rawLocation = Map<String, Object?>.from(rawResult);
+    _logLocation('腾讯原始定位返回：$rawLocation');
+    final address = await _buildTencentAddressWithFallback(
+      rawLocation: rawLocation,
+      key: tencentKey,
+    );
+    _logLocation('腾讯地址映射结果：${_addressSummary(address)}');
+    return _database.upsertAddressByDistrict(address);
+  }
+
+  /// 优先使用腾讯 Android SDK 返回的行政区划；如果 SDK 只返回经纬度，
+  /// 再调用腾讯 WebService 逆地址解析兜底。
+  Future<AddressRecord> _buildTencentAddressWithFallback({
+    required Map<String, Object?> rawLocation,
+    required String key,
+  }) async {
+    try {
+      return buildTencentNativeAddressRecord(rawLocation);
+    } on LocationAddressException catch (error) {
+      final latitude = _readDouble(rawLocation, 'latitude');
+      final longitude = _readDouble(rawLocation, 'longitude');
+      if (latitude == null || longitude == null) {
+        rethrow;
+      }
+
+      _logLocation(
+        '腾讯 SDK 行政区划不可用，尝试 WebService 逆地址解析兜底：'
+        '${error.message}',
+      );
+      return _reverseTencentCoordinatesByWebService(
+        latitude: latitude,
+        longitude: longitude,
+        key: key,
+      );
+    }
+  }
+
+  /// 使用腾讯 WebService 按经纬度逆地址解析。
+  Future<AddressRecord> _reverseTencentCoordinatesByWebService({
+    required double latitude,
+    required double longitude,
+    required String key,
+  }) async {
+    final geocoderUri = _tencentGeocoderUri.replace(
+      queryParameters: {
+        'key': key,
+        'location': '$latitude,$longitude',
+        'get_poi': '0',
+        'output': 'json',
+      },
+    );
+    final geocoderJson = await _getTencentJson(geocoderUri);
+    _logLocation('腾讯 WebService 逆地址原始返回：$geocoderJson');
+    final address = buildTencentGeocoderAddressRecord(geocoderJson);
+    if (address == null) {
+      throw const LocationAddressException('腾讯 WebService 逆地址解析结果为空。');
+    }
+    _ensureAddressCanBeSaved(
+      address,
+      source: '腾讯 WebService 逆地址解析',
+      rawLocation: geocoderJson,
+    );
+    return address;
+  }
+
+  /// 检查当前网络是否能快速访问 Google，用于选择定位服务。
+  Future<bool> _isGoogleReachable() async {
+    final client = _httpClient ?? http.Client();
+    final shouldCloseClient = _httpClient == null;
+    try {
+      final response = await client
+          .head(_googleProbeUri)
+          .timeout(_googleReachabilityTimeout);
+      _logLocation('Google 连通性 HTTP 状态：${response.statusCode}');
+      return response.statusCode >= 200 && response.statusCode < 400;
+    } catch (error) {
+      _logLocation('Google 连通性检测失败：$error');
+      return false;
+    } finally {
+      if (shouldCloseClient) {
+        client.close();
+      }
+    }
   }
 
   /// 根据用户输入的位置名称搜索候选位置。
@@ -373,7 +524,8 @@ class LocationAddressService {
       return null;
     }
 
-    final components = resultMap['address_components'];
+    final components =
+        resultMap['address_components'] ?? resultMap['address_component'];
     final addressComponents = components is Map
         ? Map<String, Object?>.from(components)
         : const <String, Object?>{};
@@ -410,6 +562,102 @@ class LocationAddressService {
       createdAt: now,
       updatedAt: now,
     );
+  }
+
+  /// 把 Android 原生腾讯定位 SDK 返回值映射为地址表模型。
+  ///
+  /// 腾讯定位的 ADMIN_AREA 级别直接返回省市区、街道和地址，不需要再调用系统
+  /// 反地理编码，因此可以避开 `reverse geo fail` 这类平台异常。
+  AddressRecord buildTencentNativeAddressRecord(Map<String, Object?> json) {
+    final latitude = _readDouble(json, 'latitude');
+    final longitude = _readDouble(json, 'longitude');
+    if (latitude == null || longitude == null) {
+      throw const LocationAddressException('腾讯定位结果缺少经纬度。');
+    }
+
+    final nation = _readString(json, 'nation');
+    final province = _readString(json, 'province');
+    final city = _readString(json, 'city');
+    final rawDistrict = _readString(json, 'district');
+    final town = _readString(json, 'town');
+    final street = _readString(json, 'street');
+    final streetNo = _readString(json, 'streetNo');
+    final name = _readString(json, 'name');
+    final address = _readString(json, 'address');
+    final district = _firstNotEmpty([rawDistrict, town, city, province, name]);
+    final shortAddress = _stripLeadingAddressParts(address, [
+      province,
+      city,
+      district,
+      town,
+      street,
+    ]);
+    final detailAddress = _joinAddressParts([
+      nation,
+      province,
+      city,
+      district,
+      if (town != district) town,
+      street,
+      streetNo,
+      shortAddress,
+      if (!shortAddress.contains(name) &&
+          name != district &&
+          name != city &&
+          name != province)
+        name,
+    ]);
+    final now = DateTime.now();
+
+    final record = AddressRecord(
+      latitude: latitude,
+      longitude: longitude,
+      province: _firstNotEmpty([province, city, district, nation, name]),
+      city: _firstNotEmpty([city, district, province, name]),
+      district: district,
+      detailAddress: detailAddress.isEmpty
+          ? _firstNotEmpty([address, name, district])
+          : detailAddress,
+      sortOrder: -1,
+      createdAt: now,
+      updatedAt: now,
+    );
+    _ensureAddressCanBeSaved(record, source: '腾讯定位', rawLocation: json);
+    return record;
+  }
+
+  /// 防止省市区全为空的定位结果落库。
+  ///
+  /// 这种数据在地址列表和首页都无法正常展示，直接抛业务异常，让首页继续刷新
+  /// 已有城市天气，同时日志里保留原始定位结果方便排查。
+  void _ensureAddressCanBeSaved(
+    AddressRecord address, {
+    required String source,
+    Object? rawLocation,
+  }) {
+    final hasDisplayArea =
+        address.province.trim().isNotEmpty ||
+        address.city.trim().isNotEmpty ||
+        address.district.trim().isNotEmpty;
+    if (hasDisplayArea) {
+      return;
+    }
+
+    _logLocation(
+      '$source 地址省市区为空，拒绝写入地址表。'
+      'address=${_addressSummary(address)}, raw=$rawLocation',
+    );
+    throw LocationAddressException('$source 返回的省市区为空，已跳过保存当前位置。');
+  }
+
+  String _addressSummary(AddressRecord address) {
+    return 'lat=${address.latitude}, lng=${address.longitude}, '
+        'province=${address.province}, city=${address.city}, '
+        'district=${address.district}, detail=${address.detailAddress}';
+  }
+
+  void _logLocation(String message) {
+    debugPrint('[AiKraiSky][Location] $message');
   }
 
   /// 检查系统定位服务和运行时权限。

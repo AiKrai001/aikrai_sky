@@ -49,6 +49,10 @@ flutter {
     source = "../.."
 }
 
+dependencies {
+    implementation("com.tencent.map.geolocation:TencentLocationSdk-openplatform:7.6.1.8")
+}
+
 // 打包前根据用户指定图片链接生成 Android 启动图标，避免手动维护多套 mipmap 尺寸。
 val generateAikraiLauncherIcons by tasks.registering {
     val sourceIconUrl = "https://pixel-oss.aikrai.com/picgo/8e333d16a90f1e110f3350977ac55a3a.png"
