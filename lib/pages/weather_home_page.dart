@@ -2408,7 +2408,7 @@ class _HourlyTemperaturePainter extends CustomPainter {
 
     final linePaint = Paint()
       ..color = Colors.white.withValues(alpha: 0.72)
-      ..strokeWidth = 2
+      ..strokeWidth = 1.35
       ..style = PaintingStyle.stroke;
     final pointPaint = Paint()
       ..color = Colors.white
@@ -2419,7 +2419,7 @@ class _HourlyTemperaturePainter extends CustomPainter {
 
     for (var index = 0; index < points.length; index += 1) {
       final point = points[index];
-      canvas.drawCircle(point, 3.0, pointPaint);
+      canvas.drawCircle(point, 2.25, pointPaint);
       _paintText(
         canvas,
         '${items[index].temperature.round()}°C',

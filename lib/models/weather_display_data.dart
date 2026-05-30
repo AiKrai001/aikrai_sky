@@ -462,14 +462,14 @@ List<DailyWeatherDisplay> _buildDailyRows({
   final daily = currentResponse.result.daily;
   final temperatureRows = _readList(daily, 'temperature');
   final skyconRows = _readList(daily, 'skycon');
-  final count = temperatureRows.length < 6 ? temperatureRows.length : 6;
+  // 彩云 daily 从今天开始返回，首页前面额外插入“昨天”，因此这里最多取 7 条，
+  // 最终列表为：昨天 + 今天 + 明天 + 后续 5 天，共 8 行。
+  final count = temperatureRows.length < 7 ? temperatureRows.length : 7;
 
   for (var index = 0; index < count; index += 1) {
     rows.add(
       _buildDailyRow(
-        dayText: index == 0
-            ? '今天'
-            : _weekdayText(DateTime.now().add(Duration(days: index))),
+        dayText: _dailyDayText(index),
         temperatureRow: temperatureRows[index],
         skyconRow: index < skyconRows.length ? skyconRows[index] : const {},
       ),
@@ -477,6 +477,16 @@ List<DailyWeatherDisplay> _buildDailyRows({
   }
 
   return rows;
+}
+
+String _dailyDayText(int index) {
+  if (index == 0) {
+    return '今天';
+  }
+  if (index == 1) {
+    return '明天';
+  }
+  return _weekdayText(DateTime.now().add(Duration(days: index)));
 }
 
 DailyWeatherDisplay _buildYesterdayRow(CaiyunWeatherResponse? response) {

@@ -201,4 +201,77 @@ void main() {
       expect(displayData.hourly[1].skycon, 'CLOUDY');
     },
   );
+
+  test('WeatherDisplayData keeps yesterday plus seven daily forecast rows', () {
+    final rawResponse = jsonEncode({
+      'status': 'ok',
+      'api_version': 'v2.6',
+      'api_status': 'active',
+      'lang': 'zh_CN',
+      'unit': 'metric',
+      'tzshift': 28800,
+      'timezone': 'Asia/Shanghai',
+      'server_time': 1779520027,
+      'location': [31.2646, 121.5051],
+      'result': {
+        'alert': {},
+        'realtime': {
+          'temperature': 26.6,
+          'skycon': 'PARTLY_CLOUDY_DAY',
+          'humidity': 0.74,
+          'wind': {'direction': 90, 'speed': 8},
+        },
+        'minutely': {},
+        'hourly': {},
+        'daily': {
+          'temperature': [
+            for (var index = 0; index < 7; index += 1)
+              {
+                'date': '2026-05-${23 + index}T00:00+08:00',
+                'max': 30 - index,
+                'min': 21 - index,
+              },
+          ],
+          'skycon': [
+            for (var index = 0; index < 7; index += 1)
+              {
+                'date': '2026-05-${23 + index}T00:00+08:00',
+                'value': 'PARTLY_CLOUDY_DAY',
+              },
+          ],
+        },
+        'primary': 0,
+        'forecast_keypoint': '天气稳定',
+      },
+    });
+
+    final displayData = WeatherDisplayData.fromRecords(
+      address: AddressRecord(
+        id: 1,
+        latitude: 31.2646,
+        longitude: 121.5051,
+        province: '上海市',
+        city: '上海市',
+        district: '虹口区',
+        detailAddress: '上海市虹口区',
+        sortOrder: 0,
+        createdAt: DateTime(2026, 5, 23, 15),
+        updatedAt: DateTime(2026, 5, 23, 15),
+      ),
+      currentRecord: WeatherRecord(
+        addressId: 1,
+        weatherDate: '2026-05-23',
+        rawResponse: rawResponse,
+        createdAt: DateTime(2026, 5, 23, 15),
+        updatedAt: DateTime(2026, 5, 23, 15),
+      ),
+    );
+
+    expect(displayData.daily, hasLength(8));
+    expect(displayData.daily.take(3).map((item) => item.dayText), [
+      '昨天',
+      '今天',
+      '明天',
+    ]);
+  });
 }
